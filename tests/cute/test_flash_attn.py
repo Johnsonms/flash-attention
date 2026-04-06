@@ -40,6 +40,19 @@ IS_SM100 = torch.cuda.get_device_capability()[0] == 10
 TEST_BWD_ONLY = False
 VERBOSE = True
 
+
+def test_flash_attn_hd192_192_bwd_rejected():
+    """(192, 192) backward should raise AssertionError on SM100/SM110."""
+    if not IS_SM100:
+        pytest.skip("SM100-only test")
+    q = torch.randn(1, 128, 2, 192, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+    k = torch.randn(1, 128, 2, 192, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+    v = torch.randn(1, 128, 2, 192, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+    out, _ = flash_attn_func(q, k, v)
+    with pytest.raises(AssertionError, match="not supported on SM100/SM110 backward"):
+        out.sum().backward()
+
+
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
@@ -127,7 +140,7 @@ def test_flash_attn_output(
     nheads_kv = nheads if mha_type == "mha" else (3 if mha_type == "gqa" else 1)
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     # dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
-    dv_vals = [128] if d == 192 else ([d] if d != 128 else [64, d])
+    dv_vals = [128, 192] if d == 192 else ([d] if d != 128 else [64, d])
     if dtype == torch.float8_e4m3fn:
         dv_vals = [d]
     # attention_chunk_vals = [torch.randint(1, seqlen_k * 2, (1,)).item(), 0]
@@ -253,7 +266,7 @@ def test_flash_attn_output(
             # SplitKV not supported on SM90 - skip this iteration
             if IS_SM90 and num_splits > 1:
                 continue
-            if IS_SM100 and (d >= 192 and dv >= 192):  # hdim 192 and 256 not support on SM100
+            if IS_SM100 and (d >= 192 and dv >= 192) and not (d == 192 and dv == 192):
                 continue
             out, lse = flash_attn_func(
                 q,

@@ -6,7 +6,7 @@
 # - noncausal & causal attention
 # - MHA, GQA, MQA
 # - hdim 64, 96, 128.
-# - (hdim_qk, hdim_v) = (192, 128) for Blackwell (i.e. DeepSeek shape)
+# - (hdim_qk, hdim_v) = (192, 128) or (192, 192) for Blackwell (forward only for (192, 192))
 # - varlen
 # - sliding window
 # - bwd pass for Ampere (will also run on Hopper/Blackwell, but will be slow)
@@ -99,9 +99,13 @@ def _get_device_arch():
     return major * 10 + int(minor)
 
 
-def _validate_head_dims(head_dim: int, head_dim_v: int, compute_capability: int, alignment: int) -> None:
+def _validate_head_dims(
+    head_dim: int, head_dim_v: int, compute_capability: int, alignment: int, is_bwd: bool = False,
+) -> None:
     """Validate head dimension constraints based on compute capability."""
-    is_deepseek_shape = head_dim == 192 and head_dim_v == 128
+    # (192, 192) is forward-only on SM100/SM110; backward only supports (192, 128).
+    hd192_v_allowed = [128] if is_bwd else [128, 192]
+    is_hd192_shape = head_dim == 192 and head_dim_v in hd192_v_allowed
     is_standard_range = 8 <= head_dim <= 128 and 8 <= head_dim_v <= 128
 
     is_sm90_range = 8 <= head_dim <= 256 and 8 <= head_dim_v <= 256
@@ -111,9 +115,13 @@ def _validate_head_dims(head_dim: int, head_dim_v: int, compute_capability: int,
             f"head_dim and head_dim_v must be between 8 and 256 and divisible by {alignment}."
         )
     elif compute_capability in [10, 11]:
-        assert (is_standard_range or is_deepseek_shape) and head_dim % alignment == 0 and head_dim_v % alignment == 0, (
-            f"(head_dim, head_dim_v)=({head_dim}, {head_dim_v}) is not supported on SM100/SM110. "
-            f"head_dim and head_dim_v must be between 8 and 128 and divisible by {alignment}, or (192, 128) for DeepSeek."
+        fwd_bwd = "backward" if is_bwd else "forward/backward"
+        assert (
+            is_standard_range or is_hd192_shape
+        ) and head_dim % alignment == 0 and head_dim_v % alignment == 0, (
+            f"(head_dim, head_dim_v)=({head_dim}, {head_dim_v}) is not supported on SM100/SM110 {fwd_bwd}. "
+            f"Supported: 8-128 (divisible by {alignment}), (192, 128)"
+            f"{', (192, 192) (forward only)' if not is_bwd else ''}."
         )
 
 
@@ -498,8 +506,12 @@ def _flash_attn_fwd(
     if max_seqlen_k is None:
         max_seqlen_k = seqlen_k
     seqlen_q_packgqa = max_seqlen_q * qhead_per_kvhead
+    head_dim_v_padded = int(math.ceil(head_dim_v / 16) * 16)
     if arch // 10 == 10:
         q_stage = 2 if seqlen_q_packgqa > tile_m else 1
+        # TMEM can't fit q_stage=2 O accumulators when hdim_v >= 192
+        if head_dim_v_padded >= 192:
+            q_stage = 1
     else:
         q_stage = 1
 
@@ -538,7 +550,7 @@ def _flash_attn_fwd(
         and not use_block_sparsity
         and page_size in [None, 128]
         and int(math.ceil(head_dim / 16) * 16) in [128, 192]
-        and int(math.ceil(head_dim_v / 16) * 16) == 128
+        and head_dim_v_padded in [128, 192]
         and seqlen_q_packgqa > 2 * tile_m
         and (tile_m % qhead_per_kvhead == 0 or not pack_gqa)
     )
@@ -1163,7 +1175,7 @@ def _flash_attn_bwd(
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
     alignment = 16 // q.element_size()
     if arch // 10 != 12:
-        _validate_head_dims(head_dim, head_dim_v, arch // 10, alignment)
+        _validate_head_dims(head_dim, head_dim_v, arch // 10, alignment, is_bwd=True)
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
     qhead_per_kvhead = num_head // num_head_kv
