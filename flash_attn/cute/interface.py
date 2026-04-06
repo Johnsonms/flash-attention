@@ -509,9 +509,11 @@ def _flash_attn_fwd(
     head_dim_v_padded = int(math.ceil(head_dim_v / 16) * 16)
     if arch // 10 == 10:
         q_stage = 2 if seqlen_q_packgqa > tile_m else 1
-        # TMEM can't fit q_stage=2 O accumulators when hdim_v >= 192
-        if head_dim_v_padded >= 192:
-            q_stage = 1
+        # TMEM can't fit q_stage=2 with tile_n=128 when hdim_v >= 192 (640 > 512 cols).
+        # Reduce tile_n to 64 so q_stage=2 fits exactly (512 cols), trading smaller KV
+        # tiles for better compute/memory overlap (2× pipeline stages compensate).
+        if q_stage == 2 and head_dim_v_padded >= 192:
+            tile_n = 64
     else:
         q_stage = 1
 
