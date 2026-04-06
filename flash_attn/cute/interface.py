@@ -21,7 +21,6 @@
 # Features not supported yet:
 # - split (i.e. FlashDecoding)
 # - tuned block sizes
-# - paged KV
 # - append KV to existing KV cache
 # - FP8
 # - bwd pass optimized for Hopper/Blackwell
@@ -167,8 +166,6 @@ def _sm100_hd256_2cta_fwd_eligible(
     seqused_q: Optional[torch.Tensor],
     seqused_k: Optional[torch.Tensor],
 ) -> bool:
-    if page_table is not None:
-        return False
     if score_mod is not None or mask_mod is not None:
         return False
     if block_sparse_tensors is not None:
@@ -243,6 +240,7 @@ def flash_attn_fwd_sm100_hd256_2cta(
     return_lse: bool = True,
     out: torch.Tensor | None = None,
     lse: torch.Tensor | None = None,
+    page_table: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention (head_dim=256, SM100 2CTA)."""
     _trace_bump_fwd_hd256_2cta()
@@ -259,15 +257,30 @@ def flash_attn_fwd_sm100_hd256_2cta(
         batch_size = cu_seqlens_q.shape[0] - 1
         total_q = q.shape[0]
 
-    seqlen_k = k.shape[-3]
-    num_head_kv = k.shape[-2]
-    if cu_seqlens_k is None:
-        assert k.shape == (batch_size, seqlen_k, num_head_kv, head_dim)
-        assert v.shape == (batch_size, seqlen_k, num_head_kv, head_dim_v)
+    if page_table is not None:
+        assert cu_seqlens_k is None, "page_table is not supported with cu_seqlens_k"
+        assert page_table.dtype == torch.int32, "page_table must be int32"
+        assert page_table.stride(-1) == 1, "page_table must be contiguous in the last dimension"
+        num_pages, page_size = k.shape[:2]
+        assert page_size == 128, (
+            f"page_size must equal n_block_size (128) for hd256 2CTA, got {page_size}"
+        )
+        assert page_table.shape == (batch_size, page_table.shape[1])
+        seqlen_k = max_seqlen_k
+        num_head_kv = k.shape[-2]
+        assert k.shape == (num_pages, page_size, num_head_kv, head_dim)
+        assert v.shape == (num_pages, page_size, num_head_kv, head_dim_v)
     else:
-        assert k.shape == (seqlen_k, num_head_kv, head_dim)
-        assert v.shape == (seqlen_k, num_head_kv, head_dim_v)
-        assert cu_seqlens_k.shape == (batch_size + 1,), "cu_seqlens_k must have shape (batch_size + 1,)"
+        num_pages, page_size = None, None
+        seqlen_k = k.shape[-3]
+        num_head_kv = k.shape[-2]
+        if cu_seqlens_k is None:
+            assert k.shape == (batch_size, seqlen_k, num_head_kv, head_dim)
+            assert v.shape == (batch_size, seqlen_k, num_head_kv, head_dim_v)
+        else:
+            assert k.shape == (seqlen_k, num_head_kv, head_dim)
+            assert v.shape == (seqlen_k, num_head_kv, head_dim_v)
+            assert cu_seqlens_k.shape == (batch_size + 1,), "cu_seqlens_k must have shape (batch_size + 1,)"
     if cu_seqlens_q is not None:
         assert cu_seqlens_q.shape == (batch_size + 1,), "cu_seqlens_q must have shape (batch_size + 1,)"
     assert seqused_q is None or seqused_q.shape == (batch_size,), "seqused_q must have shape (batch_size,)"
@@ -341,7 +354,15 @@ def flash_attn_fwd_sm100_hd256_2cta(
         assert lse.is_cuda, "lse tensor must be on CUDA device"
 
     h_r = num_head // num_head_kv
-    if cu_seqlens_q is not None:
+    is_paged = page_table is not None
+    if cu_seqlens_q is not None and is_paged:
+        total_q = q.shape[0]
+        q = q.view(1, total_q, num_head_kv, h_r, head_dim)
+        k = k.view(num_pages, page_size, num_head_kv, 1, head_dim)
+        v = v.view(num_pages, page_size, num_head_kv, 1, head_dim_v)
+        out = out.view(1, total_q, num_head_kv, h_r, head_dim_v)
+        lse = lse.view(1, num_head_kv, h_r, total_q)
+    elif cu_seqlens_q is not None:
         total_q = q.shape[0]
         total_k = k.shape[0]
         q = q.view(1, total_q, num_head_kv, h_r, head_dim)
@@ -349,6 +370,12 @@ def flash_attn_fwd_sm100_hd256_2cta(
         v = v.view(1, total_k, num_head_kv, 1, head_dim_v)
         out = out.view(1, total_q, num_head_kv, h_r, head_dim_v)
         lse = lse.view(1, num_head_kv, h_r, total_q)
+    elif is_paged:
+        q = q.view(batch_size, seqlen_q, num_head_kv, h_r, head_dim)
+        k = k.view(num_pages, page_size, num_head_kv, 1, head_dim)
+        v = v.view(num_pages, page_size, num_head_kv, 1, head_dim_v)
+        out = out.view(batch_size, seqlen_q, num_head_kv, h_r, head_dim_v)
+        lse = lse.view(batch_size, num_head_kv, h_r, seqlen_q)
     else:
         q = q.view(batch_size, seqlen_q, num_head_kv, h_r, head_dim)
         k = k.view(batch_size, seqlen_k, num_head_kv, 1, head_dim)
@@ -359,14 +386,24 @@ def flash_attn_fwd_sm100_hd256_2cta(
     dtype = torch2cute_dtype_map[q.dtype]
     qkvo_dynamic_modes = (1,) if cu_seqlens_q is not None else (0, 1)
 
-    q_tensor, k_tensor, v_tensor, o_tensor = [
+    q_tensor, o_tensor = [
         convert_from_dlpack_compact_dynamic(
             t.detach(),
             dynamic_modes=qkvo_dynamic_modes,
             alignment=16,
             enable_tvm_ffi=ENABLE_TVM_FFI,
         )
-        for t in (q, k, v, out)
+        for t in (q, out)
+    ]
+    kv_dynamic_modes = (0, 1) if is_paged else qkvo_dynamic_modes
+    k_tensor, v_tensor = [
+        convert_from_dlpack_compact_dynamic(
+            t.detach(),
+            dynamic_modes=kv_dynamic_modes,
+            alignment=16,
+            enable_tvm_ffi=ENABLE_TVM_FFI,
+        )
+        for t in (k, v)
     ]
     lse_dynamic_modes = (3,) if cu_seqlens_q is not None else (0, 3)
     lse_tensor = convert_from_dlpack_compact_dynamic(
@@ -383,6 +420,14 @@ def flash_attn_fwd_sm100_hd256_2cta(
         else None
         for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
     ]
+
+    page_table_tensor = (
+        convert_from_dlpack_compact_dynamic(
+            page_table.detach(), dynamic_modes=(0, 1), alignment=4, enable_tvm_ffi=ENABLE_TVM_FFI
+        )
+        if page_table is not None
+        else None
+    )
 
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
@@ -416,7 +461,7 @@ def flash_attn_fwd_sm100_hd256_2cta(
         mask_type = MaskEnum.RESIDUAL_MASK if (seqlens_k % tile_mn[1] != 0).any() else MaskEnum.WINDOW_MASK_INFERENCE
     elif seqlen_k % tile_mn[1] != 0:
         mask_type = MaskEnum.RESIDUAL_MASK
-    compile_key = (*base_key, window_size_left, window_size_right, mask_type, USE_CLC)
+    compile_key = (*base_key, window_size_left, window_size_right, mask_type, USE_CLC, is_paged)
     extra_args = (
         window_size_left if window_size_left is None else Int32(window_size_left),
         window_size_right if window_size_right is None else Int32(window_size_right),
@@ -435,6 +480,7 @@ def flash_attn_fwd_sm100_hd256_2cta(
         softmax_scale,
         scale_output,
     )
+    paged_args = (page_table_tensor,)
 
     if compile_key not in flash_attn_fwd_sm100_hd256_2cta.compile_cache:  # type: ignore[attr-defined]
         qk_acc_dtype = torch2cute_dtype_map[torch.float32]
@@ -447,10 +493,12 @@ def flash_attn_fwd_sm100_hd256_2cta(
             False,
             mask_type,
             use_clc_scheduler=USE_CLC,
+            paged_kv_non_tma=is_paged,
         )
         flash_attn_fwd_sm100_hd256_2cta.compile_cache[compile_key] = cute.compile(  # type: ignore[attr-defined]
             fa_fwd,
             *common_args,
+            *paged_args,
             *extra_args,
             current_stream,
             options="--enable-tvm-ffi" if ENABLE_TVM_FFI else "",
@@ -458,6 +506,7 @@ def flash_attn_fwd_sm100_hd256_2cta(
 
     flash_attn_fwd_sm100_hd256_2cta.compile_cache[compile_key](  # type: ignore[attr-defined]
         *common_args,
+        *paged_args,
         *extra_args,
         current_stream,
     )
@@ -1141,11 +1190,12 @@ def _flash_attn_fwd(
                 return_lse=return_lse,
                 out=out,
                 lse=lse,
+                page_table=page_table,
             )
         raise NotImplementedError(
             "SM100/SM110 with head_dim=head_dim_v=256 is implemented only via the 2CTA Cute-DSL kernels "
             "for a restricted API. This call is not supported: use seqused_q/seqused_k=None, "
-            "page_table=None, no score_mod/mask_mod/block sparsity, softcap=0, learnable_sink=None, "
+            "no score_mod/mask_mod/block sparsity, softcap=0, learnable_sink=None, "
             "num_splits=1, aux_tensors=None, and default tiling (tile_mn=None)."
         )
 

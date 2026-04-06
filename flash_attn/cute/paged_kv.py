@@ -170,6 +170,112 @@ class PagedKVManager(ParamsBase):
         return tPrXPtr
 
     @cute.jit
+    def _flatten_smem_sm100(self, sX: cute.Tensor, K_or_V: str):
+        """Flatten hierarchical SM100 smem layout to 2D and transpose V.
+
+        SM100 smem has shape ((a, b), cta_split, k_dim). This flattens to
+        (a, (b, k_dim)) by dropping mode 1 (the 2CTA split), then transposes
+        V to match its transposed gmem layout (d, page_size).
+        """
+        sX_pi = cute.make_tensor(
+            sX.iterator,
+            cute.make_layout(
+                (sX.shape[0][0], (sX.shape[0][1], sX.shape[2])),
+                stride=(sX.stride[0][0], (sX.stride[0][1], sX.stride[2])),
+            ),
+        )
+        if const_expr(K_or_V == "V"):
+            sX_pi = cute.make_tensor(sX_pi.iterator, cute.select(sX_pi.layout, mode=[1, 0]))
+        return sX_pi
+
+    @cute.jit
+    def _copy_row_async(
+        self, tXsX: cute.Tensor, tXcX: cute.Tensor,
+        mX_paged_cur_copy: cute.Tensor, m: Int32, should_load: cute.Tensor,
+    ):
+        """Issue cp.async copies for one row across all k-tiles."""
+        for k in cutlass.range_constexpr(cute.size(tXsX, mode=[2])):
+            ki = tXcX[0, 0, k][1] // self.async_copy_elems
+            mX_paged_cur_copy_ki = mX_paged_cur_copy[None, ki]
+            tXsX_k = tXsX[None, m, k]
+            mX_paged_cur_copy_ki = cute.make_tensor(
+                mX_paged_cur_copy_ki.iterator, tXsX_k.layout
+            )
+            cute.copy(
+                self.gmem_tiled_copy_KV,
+                mX_paged_cur_copy_ki,
+                tXsX_k,
+                pred=should_load,
+            )
+
+    @cute.jit
+    def load_KV_subtile(
+        self,
+        n_block: Int32,
+        sX: cute.Tensor,
+        K_or_V: str,
+        subtile_idx: Int32,
+        subtile_size: cutlass.Constexpr[Int32],
+        cta_n_offset: Int32 = 0,
+        cta_head_dim_offset: Int32 = 0,
+    ):
+        """Load a sub-tile from paged KV gmem via cp.async into per-CTA smem.
+
+        For hd256 2CTA kernels where each pipeline stage holds a sub-tile
+        rather than a full block. subtile_idx selects which portion along
+        head_dim to load (0 or 1 for hd256 with subtile_size=128).
+
+        For 2CTA, the B operand smem is split across CTAs along the N (seqlen)
+        dimension for K, and along head_dim for V. cta_n_offset is this CTA's
+        row offset within the n_block (used for K). cta_head_dim_offset is
+        this CTA's head_dim offset (used for V). The smem flatten (dropping
+        mode 1) naturally produces the per-CTA shape, so the identity tensor
+        and loop count adapt automatically.
+        """
+        assert K_or_V in ("K", "V")
+
+        tPrXPtr = self.compute_X_ptr(K_or_V)
+        sX_pi = self._flatten_smem_sm100(sX, K_or_V)
+
+        # Derive identity tensor from the per-CTA smem shape (handles 1CTA and 2CTA)
+        smem_rows = cute.size(sX_pi, mode=[0])
+        smem_cols = cute.size(sX_pi, mode=[1])
+        cX = cute.make_identity_tensor((smem_rows, smem_cols))
+        tXsX = self.gmem_thr_copy_KV.partition_D(sX_pi)
+        tXcX = self.gmem_thr_copy_KV.partition_S(cX)
+        tXc0X = self.gmem_thr_copy_KV.get_slice(0).partition_S(cX)
+
+        dtype_bytes = self.mK_paged.element_type.width // 8
+        head_dim_offset = subtile_idx * subtile_size + cta_head_dim_offset
+        head_dim_byte_offset = cutlass.Int64(head_dim_offset) * cutlass.Int64(dtype_bytes)
+
+        # For 2CTA, offset the register index into tPrXPtr so each CTA reads
+        # its own rows. tPrXPtr has page_entry_per_thread entries covering all
+        # n_block_size rows; cta_register_offset skips to this CTA's portion.
+        cta_register_offset = cta_n_offset // self.num_threads
+
+        seqlenk_row_limit = self.seqlen_k - n_block * self.n_block_size - cta_n_offset if n_block >= 0 else 0
+        for m in cutlass.range_constexpr(cute.size(tXsX, mode=[1])):
+            # After transpose, V's seqlen dimension is in mode 1 (cols), not mode 0 (rows)
+            seqlen_coord = tXc0X[0, m, 0][1] if const_expr(K_or_V == "V") else tXc0X[0, m, 0][0]
+            row_valid = seqlen_coord < seqlenk_row_limit
+            should_load = cute.make_fragment_like(tXsX[(0, None), m, 0], cute.Boolean)
+            should_load.fill(row_valid)
+
+            x_ptr_i64 = utils.shuffle_sync(
+                tPrXPtr[(m // self.gmem_threads_per_row) + cta_register_offset],
+                m % self.gmem_threads_per_row,
+                width=self.gmem_threads_per_row,
+            )
+            x_ptr_i64 = x_ptr_i64 + head_dim_byte_offset
+            x_gmem_ptr = cute.make_ptr(
+                self.mK_paged.element_type, x_ptr_i64, cute.AddressSpace.gmem, assumed_align=16
+            )
+            mX_paged_cur = cute.make_tensor(x_gmem_ptr, cute.make_layout((smem_cols,)))
+            mX_paged_cur_copy = cute.tiled_divide(mX_paged_cur, (self.async_copy_elems,))
+            self._copy_row_async(tXsX, tXcX, mX_paged_cur_copy, m, should_load)
+
+    @cute.jit
     def load_KV(self, n_block: Int32, sX: cute.Tensor, K_or_V: str):
         assert K_or_V in ("K", "V")
 
@@ -181,18 +287,7 @@ class PagedKVManager(ParamsBase):
             sX_pi = cute.group_modes(sX, 0, 1)
             # SM90 does NOT transpose V here (it's transposed via utils.transpose_view before MMA)
         else:
-            # SM100: Finesse sX layout to be (M, N).
-            sX_pi = cute.make_tensor(
-                sX.iterator,
-                cute.make_layout(
-                    (sX.shape[0][0], (sX.shape[0][1], sX.shape[2])),
-                    stride=(sX.stride[0][0], (sX.stride[0][1], sX.stride[2])),
-                ),
-            )
-
-            if const_expr(K_or_V == "V"):
-                # Transpose smem V to match transposed gmem layout
-                sX_pi = cute.make_tensor(sX_pi.iterator, cute.select(sX_pi.layout, mode=[1, 0]))
+            sX_pi = self._flatten_smem_sm100(sX, K_or_V)
 
         head_dim = self.head_dim_v_padded if const_expr(K_or_V == "V") else self.head_dim_padded
         cX = cute.make_identity_tensor((self.n_block_size, head_dim))
@@ -218,17 +313,4 @@ class PagedKVManager(ParamsBase):
             )
             mX_paged_cur = cute.make_tensor(x_gmem_ptr, cute.make_layout((head_dim,)))
             mX_paged_cur_copy = cute.tiled_divide(mX_paged_cur, (self.async_copy_elems,))
-
-            for k in cutlass.range_constexpr(cute.size(tXsX, mode=[2])):
-                ki = tXcX[0, 0, k][1] // self.async_copy_elems
-                mX_paged_cur_copy_ki = mX_paged_cur_copy[None, ki]
-                tXsX_k = tXsX[None, m, k]
-                mX_paged_cur_copy_ki = cute.make_tensor(
-                    mX_paged_cur_copy_ki.iterator, tXsX_k.layout
-                )
-                cute.copy(
-                    self.gmem_tiled_copy_KV,
-                    mX_paged_cur_copy_ki,
-                    tXsX_k,
-                    pred=should_load,
-                )
+            self._copy_row_async(tXsX, tXcX, mX_paged_cur_copy, m, should_load)
