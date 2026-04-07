@@ -133,6 +133,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         scale_softmax: Float32,
         scale_output: Float32,
         page_table_tensor: Optional[cute.Tensor],
+        seqused_k_tensor: Optional[cute.Tensor],
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
         stream: cuda.CUstream,
@@ -186,6 +187,14 @@ class BlackwellFusedMultiHeadAttentionForward:
             page_table = cute.make_tensor(page_table_tensor.iterator, page_table_layout)
         else:
             page_table = None
+        if const_expr(seqused_k_tensor is not None):
+            seqused_k = cute.make_tensor(
+                seqused_k_tensor.iterator,
+                cute.make_layout((b,), stride=(1,)),
+            )
+        else:
+            seqused_k = None
+        if const_expr(page_table_tensor is None):
             # (s, d, ((h_r, h_k), b)), 0-stride for h_r to broadcast
             k_layout = cute.make_layout(
                 (s_k_total, d, ((h_r, h_k), b)),
@@ -232,6 +241,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                 (s_q, o.shape[1], o.shape[2]) if cum_seqlen_q is not None else o.shape,
                 self.cta_tiler,
                 self.is_persistent,
+                (*self.cluster_shape_mn, 1),
             )
 
         self.q_major_mode = utils.LayoutEnum.from_tensor(q).mma_major_mode()
@@ -397,6 +407,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             scale_softmax,
             scale_output,
             page_table,
+            seqused_k,
             Int32(s_k) if page_table_tensor is not None else None,
             window_size_left,
             window_size_right,
@@ -434,6 +445,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         scale_softmax: Float32,
         scale_output: Float32,
         mPageTable: Optional[cute.Tensor],
+        mSeqUsedK: Optional[cute.Tensor],
         max_seqlen_k: Optional[Int32],
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
@@ -665,7 +677,10 @@ class BlackwellFusedMultiHeadAttentionForward:
         else:
             blk_idx = cute.arch.block_idx()
             tile_sched = FmhaStaticTileScheduler(
-                tile_sched_params, blk_idx[0], blk_idx, cute.arch.grid_dim()
+                tile_sched_params,
+                blk_idx[0] // self.cluster_shape_mnk[0],
+                blk_idx,
+                cute.arch.grid_dim(),
             )
         work_tile = tile_sched.initial_work_tile_info()
 
@@ -689,7 +704,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                 continue_cond = False
                 batch_coord = curr_block_coord[2][1]
                 seqlen_q = mQ_qdl.shape[0]
-                seqlen_k = mK_kdl.shape[0] if const_expr(mPageTable is None) else max_seqlen_k
+                seqlen_k = mSeqUsedK[batch_coord] if const_expr(mSeqUsedK is not None) else (mK_kdl.shape[0] if const_expr(mPageTable is None) else max_seqlen_k)
                 cuseqlen_q = Int32(0)
                 cuseqlen_k = Int32(0)
                 block_offset = (
@@ -925,9 +940,9 @@ class BlackwellFusedMultiHeadAttentionForward:
                     curr_block_coord[2],
                 )
                 continue_cond = False
-                seqlen_q = mQ_qdl.shape[0]
-                seqlen_k = mK_kdl.shape[0] if const_expr(mPageTable is None) else max_seqlen_k
                 batch_coord = curr_block_coord[2][1]
+                seqlen_q = mQ_qdl.shape[0]
+                seqlen_k = mSeqUsedK[batch_coord] if const_expr(mSeqUsedK is not None) else (mK_kdl.shape[0] if const_expr(mPageTable is None) else max_seqlen_k)
                 if cutlass.const_expr(cum_seqlen_q is not None):
                     cuseqlen_q = cum_seqlen_q[batch_coord]
                     seqlen_q = cum_seqlen_q[batch_coord + 1] - cuseqlen_q
@@ -1223,7 +1238,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                 batch_coord = curr_block_coord[2][1]
                 continue_cond = False
                 seqlen_q = mQ_qdl.shape[0]
-                seqlen_k = mK_kdl.shape[0] if const_expr(mPageTable is None) else max_seqlen_k
+                seqlen_k = mSeqUsedK[batch_coord] if const_expr(mSeqUsedK is not None) else (mK_kdl.shape[0] if const_expr(mPageTable is None) else max_seqlen_k)
                 cuseqlen_q = Int32(0)
                 if cutlass.const_expr(cum_seqlen_q is not None):
                     cuseqlen_q = cum_seqlen_q[batch_coord]
@@ -1334,7 +1349,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                 )
                 batch_coord = curr_block_coord[2][1]
                 seqlen_q = mQ_qdl.shape[0]
-                seqlen_k = mK_kdl.shape[0] if const_expr(mPageTable is None) else max_seqlen_k
+                seqlen_k = mSeqUsedK[batch_coord] if const_expr(mSeqUsedK is not None) else (mK_kdl.shape[0] if const_expr(mPageTable is None) else max_seqlen_k)
                 continue_cond = False
                 cuseqlen_q = Int32(0)
                 if cutlass.const_expr(cum_seqlen_q is not None):

@@ -418,7 +418,7 @@ def flash_attn_fwd_sm100_hd256_2cta(
         alignment=4,
         enable_tvm_ffi=ENABLE_TVM_FFI,
     )
-    cu_seqlens_q_tensor, cu_seqlens_k_tensor, _, _ = [
+    cu_seqlens_q_tensor, cu_seqlens_k_tensor, _, seqused_k_tensor = [
         convert_from_dlpack_compact_dynamic(
             t.detach(), dynamic_modes=(0,), alignment=4, enable_tvm_ffi=ENABLE_TVM_FFI
         )
@@ -465,9 +465,17 @@ def flash_attn_fwd_sm100_hd256_2cta(
     elif cu_seqlens_k is not None:
         seqlens_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
         mask_type = MaskEnum.RESIDUAL_MASK if (seqlens_k % tile_mn[1] != 0).any() else MaskEnum.WINDOW_MASK_INFERENCE
+    elif seqused_k is not None:
+        mask_type = MaskEnum.RESIDUAL_MASK if (seqused_k % tile_mn[1] != 0).any() else MaskEnum.WINDOW_MASK_INFERENCE
     elif seqlen_k % tile_mn[1] != 0:
         mask_type = MaskEnum.RESIDUAL_MASK
-    compile_key = (*base_key, window_size_left, window_size_right, mask_type, USE_CLC, is_paged)
+
+    # Persistent scheduling: grid-stride loop over tiles amortizes CTA launch
+    # overhead at high tile counts. For decode (seqlen_q=1), num_m_blocks=1
+    # so no CTA gets an invalid tile — no tile skipping logic needed.
+    is_persistent = cu_seqlens_q is None and not causal
+
+    compile_key = (*base_key, window_size_left, window_size_right, mask_type, USE_CLC, is_paged, is_persistent)
     extra_args = (
         window_size_left if window_size_left is None else Int32(window_size_left),
         window_size_right if window_size_right is None else Int32(window_size_right),
@@ -486,7 +494,7 @@ def flash_attn_fwd_sm100_hd256_2cta(
         softmax_scale,
         scale_output,
     )
-    paged_args = (page_table_tensor,)
+    paged_args = (page_table_tensor, seqused_k_tensor)
 
     if compile_key not in flash_attn_fwd_sm100_hd256_2cta.compile_cache:  # type: ignore[attr-defined]
         qk_acc_dtype = torch2cute_dtype_map[torch.float32]
@@ -496,7 +504,7 @@ def flash_attn_fwd_sm100_hd256_2cta(
             qk_acc_dtype,
             pv_acc_dtype,
             mma_tiler,
-            False,
+            is_persistent,
             mask_type,
             use_clc_scheduler=USE_CLC,
         )

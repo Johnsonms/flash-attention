@@ -1025,6 +1025,7 @@ class Sm100FmhaStaticTileSchedulerParams:
         self,
         is_persistent: bool,
         problem_shape_mbh: cute.Shape,
+        cluster_shape_m: cutlass.Constexpr[int] = 1,
         *,
         loc=None,
         ip=None,
@@ -1039,6 +1040,7 @@ class Sm100FmhaStaticTileSchedulerParams:
         """
         self.is_persistent = is_persistent
         self.problem_shape_mbh = problem_shape_mbh
+        self.cluster_shape_m = cluster_shape_m
         self._loc = loc
         self._ip = ip
 
@@ -1056,7 +1058,7 @@ class Sm100FmhaStaticTileSchedulerParams:
             obj_list.append(new_from_mlir_values(obj, values[:n_items]))
             values = values[n_items:]
         return Sm100FmhaStaticTileSchedulerParams(
-            self.is_persistent, *(tuple(obj_list)), loc=self._loc
+            self.is_persistent, *(tuple(obj_list)), self.cluster_shape_m, loc=self._loc
         )
 
 
@@ -1083,8 +1085,8 @@ class Sm100FmhaStaticTileScheduler:
     :type _num_blocks: Int32
     :ivar _is_first_block: Whether this is the first block.
     :type _is_first_block: bool
-    :ivar num_persistent_sm: Number of persistent SMs.
-    :type num_persistent_sm: Int32
+    :ivar num_persistent_clusters: Number of persistent clusters.
+    :type num_persistent_clusters: Int32
     """
 
     def __init__(
@@ -1119,7 +1121,10 @@ class Sm100FmhaStaticTileScheduler:
         )
         self._num_blocks = cute.size(self._problem_shape_mbh, loc=loc, ip=ip)
         self._is_first_block = True
-        self.num_persistent_sm = cute.size(grid_shape, loc=loc, ip=ip)
+        self.cluster_shape_m = params.cluster_shape_m
+        self.num_persistent_clusters = (
+            cute.size(grid_shape, loc=loc, ip=ip) // self.cluster_shape_m
+        )
         self._loc = loc
         self._ip = ip
 
@@ -1147,8 +1152,13 @@ class Sm100FmhaStaticTileScheduler:
         if params.is_persistent:
             hardware_info = HardwareInfo()
             sm_count = hardware_info.get_device_multiprocessor_count()
+            max_ctas = (sm_count // params.cluster_shape_m) * params.cluster_shape_m
             return (
-                dsl_min(sm_count, cute.size(params.problem_shape_mbh, loc=loc, ip=ip)),
+                dsl_min(
+                    max_ctas,
+                    cute.size(params.problem_shape_mbh, loc=loc, ip=ip)
+                    * params.cluster_shape_m,
+                ),
                 1,
                 1,
             )
@@ -1203,9 +1213,18 @@ class Sm100FmhaStaticTileScheduler:
         else:
             blk_coord = self._blk_coord
 
-        # cur_tile_coord is (mid, 0, (bid, hid))
+        # cur_tile_coord is (mid, 0, (hid, bid))
+        # For 2CTA clusters, mid must encode both the logical m_block and the
+        # CTA rank within the cluster (0 or 1) so that each CTA processes its
+        # half of the tile.  Non-persistent gets this for free from block_idx().
+        # Persistent must reconstruct it: mid = m_block * cluster_shape_m + cta_rank.
+        if self._is_persistent:
+            cta_rank = self._blk_coord[0] % self.cluster_shape_m
+            mid = blk_coord[0] * self.cluster_shape_m + cta_rank
+        else:
+            mid = blk_coord[0]
         cur_tile_coord = (
-            blk_coord[0],
+            mid,
             0,
             (blk_coord[1], blk_coord[2]),
         )
@@ -1229,7 +1248,7 @@ class Sm100FmhaStaticTileScheduler:
         For non-persistent kernels, marks that the first block has been processed.
         """
         if self._is_persistent:
-            self._current_work_linear_idx += advance_count * self.num_persistent_sm
+            self._current_work_linear_idx += advance_count * self.num_persistent_clusters
         self._is_first_block = False
         return self.get_current_work()
 
@@ -1265,6 +1284,7 @@ def compute_sm100_fmha_grid(
     o_shape: cute.Shape,
     cta_tiler: Tuple[int, int, int],
     is_persistent: bool,
+    cluster_shape_mnk: Tuple[int, int, int] = (1, 1, 1),
 ) -> Tuple[Sm100FmhaStaticTileSchedulerParams, Tuple[int, int, int]]:
     """Compute grid parameters for FMHA (static scheduler).
 
@@ -1277,6 +1297,7 @@ def compute_sm100_fmha_grid(
             cute.size(o_shape[2][0]),
             cute.size(o_shape[2][1]),
         ),
+        cluster_shape_mnk[0],
     )
     grid = Sm100FmhaStaticTileScheduler.get_grid_shape(tile_sched_params)
     return tile_sched_params, grid
