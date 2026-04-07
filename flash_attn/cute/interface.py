@@ -166,6 +166,12 @@ def _sm100_hd256_2cta_fwd_eligible(
     seqused_q: Optional[torch.Tensor],
     seqused_k: Optional[torch.Tensor],
 ) -> bool:
+    if page_table is not None:
+        # The 2CTA kernel supports TMA paged KV (page_size must equal tile_n=128),
+        # but the generic SM100 persistent kernel is currently faster for paged
+        # workloads across all sequence lengths. Route paged to generic until the
+        # 2CTA scheduler is optimized for paged KV.
+        return False
     if score_mod is not None or mask_mod is not None:
         return False
     if block_sparse_tensors is not None:
@@ -493,7 +499,6 @@ def flash_attn_fwd_sm100_hd256_2cta(
             False,
             mask_type,
             use_clc_scheduler=USE_CLC,
-            paged_kv_non_tma=is_paged,
         )
         flash_attn_fwd_sm100_hd256_2cta.compile_cache[compile_key] = cute.compile(  # type: ignore[attr-defined]
             fa_fwd,
@@ -1192,17 +1197,21 @@ def _flash_attn_fwd(
                 lse=lse,
                 page_table=page_table,
             )
-        raise NotImplementedError(
-            "SM100/SM110 with head_dim=head_dim_v=256 is implemented only via the 2CTA Cute-DSL kernels "
-            "for a restricted API. This call is not supported: use seqused_q/seqused_k=None, "
-            "no score_mod/mask_mod/block sparsity, softcap=0, learnable_sink=None, "
-            "num_splits=1, aux_tensors=None, and default tiling (tile_mn=None)."
-        )
+        if page_table is None:
+            raise NotImplementedError(
+                "SM100/SM110 with head_dim=head_dim_v=256 is implemented only via the 2CTA Cute-DSL kernels "
+                "for a restricted API. This call is not supported: use seqused_q/seqused_k=None, "
+                "no score_mod/mask_mod/block sparsity, softcap=0, learnable_sink=None, "
+                "num_splits=1, aux_tensors=None, and default tiling (tile_mn=None)."
+            )
 
     seqlen_q_packgqa = max_seqlen_q * qhead_per_kvhead
     if arch // 10 == 10:
         q_stage = 2 if seqlen_q_packgqa > tile_m else 1
     else:
+        q_stage = 1
+    if arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256:
+        # (256, 256) only fits in TMEM on Blackwell with q_stage=1.
         q_stage = 1
 
     m_block_size_effective = q_stage * tile_m
@@ -1239,8 +1248,8 @@ def _flash_attn_fwd(
         and seqused_q is None
         and not use_block_sparsity
         and page_size in [None, 128]
-        and int(math.ceil(head_dim / 16) * 16) in [128, 192]
-        and int(math.ceil(head_dim_v / 16) * 16) == 128
+        and int(math.ceil(head_dim / 16) * 16) in [128, 192, 256]
+        and int(math.ceil(head_dim_v / 16) * 16) in [128, 256]
         and seqlen_q_packgqa > 2 * tile_m
         and (tile_m % qhead_per_kvhead == 0 or not pack_gqa)
     )

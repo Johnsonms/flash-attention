@@ -1753,6 +1753,81 @@ def test_flash_attn_paged_deepseek(seqlen_q, page_size):
     assert torch.equal(out, out_ref)
 
 
+@pytest.mark.parametrize("seqlen_q", [128, 2048])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_paged_hd256_sm100_tma(seqlen_q):
+    """Test TMA paged KV in the hd256 2CTA kernel on SM100.
+
+    Verifies that paged KV (page_table + TMA) produces identical output to
+    the non-paged varlen path, and that results are deterministic across runs.
+    """
+    if not IS_SM100:
+        pytest.skip("SM100-specific paged hd256 test")
+    from flash_attn.cute.interface import flash_attn_fwd_sm100_hd256_2cta
+
+    device = "cuda"
+    dtype = torch.bfloat16
+    d = 256
+    batch_size = 2
+    nheads = 16
+    nheads_kv = 16
+    page_size = 128
+
+    torch.random.manual_seed(0)
+    q = torch.randn(batch_size * seqlen_q, nheads, d, device=device, dtype=dtype)
+    k = torch.randn(batch_size * seqlen_q, nheads_kv, d, device=device, dtype=dtype)
+    v = torch.randn(batch_size * seqlen_q, nheads_kv, d, device=device, dtype=dtype)
+    cu_seqlens_q = torch.arange(0, batch_size + 1, dtype=torch.int32, device=device) * seqlen_q
+    cu_seqlens_k = torch.arange(0, batch_size + 1, dtype=torch.int32, device=device) * seqlen_q
+
+    # Non-paged reference (varlen with cu_seqlens_k)
+    out_ref, _ = flash_attn_fwd_sm100_hd256_2cta(
+        q, k, v,
+        cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+        seqused_q=None, seqused_k=None,
+        max_seqlen_q=seqlen_q, max_seqlen_k=seqlen_q,
+    )
+
+    # Build paged KV from contiguous KV
+    num_pages_per_seq = seqlen_q // page_size
+    total_pages = batch_size * num_pages_per_seq
+    k_paged = torch.zeros(total_pages, page_size, nheads_kv, d, device=device, dtype=dtype)
+    v_paged = torch.zeros(total_pages, page_size, nheads_kv, d, device=device, dtype=dtype)
+    for b in range(batch_size):
+        for s in range(seqlen_q):
+            pi = b * num_pages_per_seq + s // page_size
+            po = s % page_size
+            k_paged[pi, po] = k[b * seqlen_q + s]
+            v_paged[pi, po] = v[b * seqlen_q + s]
+    page_table = torch.arange(total_pages, dtype=torch.int32, device=device).reshape(
+        batch_size, num_pages_per_seq
+    )
+
+    # Paged via 2CTA kernel (TMA paged path) — run twice for determinism check
+    out_paged_0, _ = flash_attn_fwd_sm100_hd256_2cta(
+        q, k_paged, v_paged,
+        cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=None,
+        seqused_q=None, seqused_k=None,
+        max_seqlen_q=seqlen_q, max_seqlen_k=seqlen_q,
+        page_table=page_table,
+    )
+    out_paged_1, _ = flash_attn_fwd_sm100_hd256_2cta(
+        q, k_paged, v_paged,
+        cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=None,
+        seqused_q=None, seqused_k=None,
+        max_seqlen_q=seqlen_q, max_seqlen_k=seqlen_q,
+        page_table=page_table,
+    )
+
+    if is_fake_mode():
+        return
+
+    print(f"Paged vs non-paged max diff: {(out_paged_0 - out_ref).abs().max().item()}")
+    print(f"Paged determinism diff: {(out_paged_1 - out_paged_0).abs().max().item()}")
+    assert torch.equal(out_paged_0, out_ref), "Paged output does not match non-paged reference"
+    assert torch.equal(out_paged_1, out_paged_0), "Paged output is not deterministic"
+
+
 @pytest.mark.parametrize("head_dim", [4, 148, 288])
 def test_flash_attn_invalid_head_dim(head_dim):
     device = "cuda"
