@@ -2005,6 +2005,108 @@ def test_flash_attn_mla_absorbed(
                 assert torch.equal(out, out2), f"non-deterministic with max diff = {(out - out2).abs().max().item()} on {iter=}"
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("d", [64])
+# MLA SplitKV requires num_n_blocks >= 64 (seqlen_k >= 8192 with tile_n=128)
+# because interface.py forces num_splits=1 when head_dim != head_dim_v and num_n_blocks < 64.
+# num_splits=0 means auto-heuristic; for MLA, user-specified num_splits is overridden anyway.
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k",
+    [
+        (1, 8192),
+        (4, 8192),
+        (64, 16384),
+        (128, 8192),
+        (256, 16384),
+        (1024, 8192),
+    ],
+)
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_mla_split_kv(
+    seqlen_q,
+    seqlen_k,
+    d,
+    causal,
+    dtype,
+):
+    if not IS_SM100:
+        pytest.skip()
+    device = "cuda"
+    seed = 0
+    random.seed(seed)
+    torch.random.manual_seed(seed)
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    batch_size = 2
+    nheads = 128
+    nheads_kv = 1
+    dv = 512
+    dtype_ref = dtype
+
+    q_ref = torch.randn(
+        batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref
+    ).to(dtype).to(dtype_ref).requires_grad_(False)
+    k_ref = torch.randn(
+        batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype_ref
+    ).to(dtype).to(dtype_ref).requires_grad_(False)
+    v_ref = torch.randn(
+        batch_size, seqlen_k, nheads_kv, dv, device=device, dtype=dtype_ref
+    ).to(dtype).to(dtype_ref).requires_grad_(False)
+    qv_ref = torch.randn(
+        batch_size, seqlen_q, nheads, dv, device=device, dtype=dtype_ref
+    ).to(dtype).to(dtype_ref)
+
+    q = q_ref.detach().to(dtype)
+    k = k_ref.detach().to(dtype)
+    v = v_ref.detach().to(dtype)
+    qv = qv_ref.detach().to(dtype)
+
+    out_ref, attn_ref = attention_ref(
+        q_ref,
+        k_ref,
+        v_ref,
+        None,
+        None,
+        causal=causal,
+        qv=qv_ref,
+    )
+    out_pt, attn_pt = attention_ref(
+        q_ref,
+        k_ref,
+        v_ref,
+        None,
+        None,
+        causal=causal,
+        qv=qv_ref,
+        upcast=False,
+        reorder_ops=True,
+    )
+
+    out, lse = flash_attn_func(
+        q,
+        k,
+        v,
+        qv=qv,
+        causal=causal,
+        pack_gqa=True,
+        num_splits=0,
+    )
+    if is_fake_mode():
+        return
+
+    fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
+    rtol = 2
+    print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
+    print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
+    print(f"Output max diff: {(out - out_ref).abs().max().item()}")
+    print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
+
+    assert (out - out_ref).abs().max().item() <= rtol * (
+        out_pt - out_ref
+    ).abs().max().item() + fwd_atol
+
+
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 # @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
