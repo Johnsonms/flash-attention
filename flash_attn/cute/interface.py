@@ -529,9 +529,16 @@ def _flash_attn_fwd(
         num_splits = num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, 128)
 
     # SplitKV uses float32 partial output, which doubles the O buffer size
-    # in shared memory, causing OOM for diff-headdim (192, 128)
-    if arch // 10 in [10, 11] and head_dim != head_dim_v and num_splits > 1:
-        if num_n_blocks >= 64 and head_dim_v != 512:
+    # in shared memory, causing OOM for diff-headdim (192, 128). MLA
+    # (head_dim_v=512) has its own Phase 3 SplitKV kernel path with a
+    # SMEM budget tuned for head_dim_v=512, so fall through for MLA.
+    if (
+        arch // 10 in [10, 11]
+        and head_dim != head_dim_v
+        and num_splits > 1
+        and head_dim_v != 512
+    ):
+        if num_n_blocks >= 64:
             tile_n = 64
             num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n
             num_splits = num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, 128)
@@ -655,13 +662,6 @@ def _flash_attn_fwd(
             assert gather_kv_indices.shape[:-1] == q.shape[:-2]
             gather_kv_length = gather_kv_indices.shape[-1]
             assert gather_kv_length % 256 == 0
-            # Topk branches in the MLA kernel hard-code n_block_min=0,
-            # n_block_max=topk_length//tile_n without using split_idx, so each
-            # split would recompute the same slice and LSE would inflate by
-            # log(num_splits). Disallow until topk partitioning is wired up.
-            assert num_splits == 1, (
-                "SplitKV (num_splits > 1) is not yet supported with gather_kv_indices"
-            )
             if min_seqlen_k is None or causal:
                 disable_sparse_kv_bitmask = False
             else:

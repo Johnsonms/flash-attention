@@ -423,7 +423,6 @@ class FlashAttentionMLAForwardSm100:
         V_layout_transpose = [1, 0, 2, 3] if const_expr(mCuSeqlensK is None) else [1, 0, 2]
         mVt = cute.make_tensor(mV.iterator, cute.select(mV.layout, mode=V_layout_transpose))
         # (b, h, s_q) -> (s_q, h, b) or (h, total_q) -> (total_q, h)
-        # (b, s_q, topk) -> (topk, s_q, b) or (total_q, topk) -> (topk, total_q)
         if const_expr(self.is_split_kv):
             # mLSE: (num_splits, b, h, s) -> (s, h, b, num_splits)
             LSE_layout_transpose = (
@@ -431,13 +430,15 @@ class FlashAttentionMLAForwardSm100:
             )
         else:
             LSE_layout_transpose = [2, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 0]
-        mLSE, mIndexTopk = (
-            cute.make_tensor(t.iterator, cute.select(t.layout, mode=LSE_layout_transpose))
-            if t is not None
-            else None
-            for t in (mLSE, mIndexTopk)
-        )
-        topk_length_dynamic = mIndexTopk.shape[0] if mIndexTopk is not None else None
+        if const_expr(mLSE is not None):
+            mLSE = cute.make_tensor(mLSE.iterator, cute.select(mLSE.layout, mode=LSE_layout_transpose))
+        # (b, s_q, topk) -> (topk, s_q, b) or (total_q, topk) -> (topk, total_q)
+        IndexTopk_layout_transpose = [2, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 0]
+        if const_expr(mIndexTopk is not None):
+            mIndexTopk = cute.make_tensor(
+                mIndexTopk.iterator, cute.select(mIndexTopk.layout, mode=IndexTopk_layout_transpose)
+            )
+        topk_length_dynamic = mIndexTopk.shape[0] if const_expr(mIndexTopk is not None) else None
 
         self.o_layout = cutlass.utils.LayoutEnum.from_tensor(mO)
 
@@ -1316,8 +1317,14 @@ class FlashAttentionMLAForwardSm100:
 
             seqlen = SeqlenInfoCls(batch_idx)
             if const_expr(self.is_topk_gather):
-                n_block_min = 0
-                n_block_max = self.topk_length // self.tile_n
+                topk_n_blocks = self.topk_length // self.tile_n
+                if const_expr(self.is_split_kv):
+                    num_n_blocks_per_split = cute.ceil_div(topk_n_blocks, num_splits)
+                    n_block_min = split_idx * num_n_blocks_per_split
+                    n_block_max = min(topk_n_blocks, n_block_min + num_n_blocks_per_split)
+                else:
+                    n_block_min = 0
+                    n_block_max = topk_n_blocks
                 # n_block_max = topk_length_dynamic // self.tile_n
             else:
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
@@ -1460,8 +1467,14 @@ class FlashAttentionMLAForwardSm100:
 
             seqlen = SeqlenInfoCls(batch_idx)
             if const_expr(self.is_topk_gather):
-                n_block_min = 0
-                n_block_max = self.topk_length // self.tile_n
+                topk_n_blocks = self.topk_length // self.tile_n
+                if const_expr(self.is_split_kv):
+                    num_n_blocks_per_split = cute.ceil_div(topk_n_blocks, num_splits)
+                    n_block_min = split_idx * num_n_blocks_per_split
+                    n_block_max = min(topk_n_blocks, n_block_min + num_n_blocks_per_split)
+                else:
+                    n_block_min = 0
+                    n_block_max = topk_n_blocks
                 # n_block_max = topk_length_dynamic // self.tile_n
             else:
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
@@ -1586,7 +1599,7 @@ class FlashAttentionMLAForwardSm100:
                     )
 
                     # gather KV path processes n_blocks in increasing order
-                    n_block = 0
+                    n_block = n_block_min
 
                     # ==== Prologue ====
                     # K, V0, V1
@@ -1606,7 +1619,7 @@ class FlashAttentionMLAForwardSm100:
                     # ==== Mainloop ====
                     for n_block_group in cutlass.range(num_n_block_groups - 1, unroll=1):
                         for stage in cutlass.range_constexpr(self.num_stages_S):
-                            n_block = n_block_group * self.num_stages_S + stage
+                            n_block = n_block_min + n_block_group * self.num_stages_S + stage
                             # K, V0, V1
                             cpasync_gather_kv_manager.load_index_topk(n_block + 1, transpose=False)
                             producer_state_K = load_K(producer_state_K)
@@ -1623,7 +1636,7 @@ class FlashAttentionMLAForwardSm100:
 
                     # ==== Epilogue ====
                     for stage in cutlass.range_constexpr(self.num_stages_S):
-                        n_block = (num_n_block_groups - 1) * self.num_stages_S + stage
+                        n_block = n_block_min + (num_n_block_groups - 1) * self.num_stages_S + stage
                         if const_expr(stage == 0):
                             # K, V0, V1
                             cpasync_gather_kv_manager.load_index_topk(n_block + 1, transpose=False)
@@ -2048,8 +2061,14 @@ class FlashAttentionMLAForwardSm100:
 
             seqlen = SeqlenInfoCls(batch_idx)
             if const_expr(self.is_topk_gather):
-                n_block_min = 0
-                n_block_max = self.topk_length // self.tile_n
+                topk_n_blocks = self.topk_length // self.tile_n
+                if const_expr(self.is_split_kv):
+                    num_n_blocks_per_split = cute.ceil_div(topk_n_blocks, num_splits)
+                    n_block_min = split_idx * num_n_blocks_per_split
+                    n_block_max = min(topk_n_blocks, n_block_min + num_n_blocks_per_split)
+                else:
+                    n_block_min = 0
+                    n_block_max = topk_n_blocks
                 # n_block_max = topk_length_dynamic // self.tile_n
             else:
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
@@ -2526,9 +2545,14 @@ class FlashAttentionMLAForwardSm100:
 
             seqlen = SeqlenInfoCls(batch_idx)
             if const_expr(self.is_topk_gather):
-                n_block_min = 0
-                # n_block_max = self.topk_length // self.tile_n
-                n_block_max = topk_length_dynamic // self.tile_n
+                topk_n_blocks = topk_length_dynamic // self.tile_n
+                if const_expr(self.is_split_kv):
+                    num_n_blocks_per_split = cute.ceil_div(topk_n_blocks, num_splits)
+                    n_block_min = split_idx * num_n_blocks_per_split
+                    n_block_max = min(topk_n_blocks, n_block_min + num_n_blocks_per_split)
+                else:
+                    n_block_min = 0
+                    n_block_max = topk_n_blocks
             else:
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
                     seqlen,
@@ -2786,8 +2810,14 @@ class FlashAttentionMLAForwardSm100:
             cluster_m_block = cta_m_block // self.cta_group_size
             seqlen = SeqlenInfoCls(batch_idx)
             if const_expr(self.is_topk_gather):
-                n_block_min = 0
-                n_block_max = self.topk_length // self.tile_n
+                topk_n_blocks = self.topk_length // self.tile_n
+                if const_expr(self.is_split_kv):
+                    num_n_blocks_per_split = cute.ceil_div(topk_n_blocks, num_splits)
+                    n_block_min = split_idx * num_n_blocks_per_split
+                    n_block_max = min(topk_n_blocks, n_block_min + num_n_blocks_per_split)
+                else:
+                    n_block_min = 0
+                    n_block_max = topk_n_blocks
                 # n_block_max = topk_length_dynamic // self.tile_n
             else:
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
@@ -3140,8 +3170,14 @@ class FlashAttentionMLAForwardSm100:
 
             seqlen = SeqlenInfoCls(batch_idx)
             if const_expr(self.is_topk_gather):
-                n_block_min = 0
-                n_block_max = self.topk_length // self.tile_n
+                topk_n_blocks = self.topk_length // self.tile_n
+                if const_expr(self.is_split_kv):
+                    num_n_blocks_per_split = cute.ceil_div(topk_n_blocks, num_splits)
+                    n_block_min = split_idx * num_n_blocks_per_split
+                    n_block_max = min(topk_n_blocks, n_block_min + num_n_blocks_per_split)
+                else:
+                    n_block_min = 0
+                    n_block_max = topk_n_blocks
                 # n_block_max = topk_length_dynamic // self.tile_n
             else:
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
@@ -3247,9 +3283,7 @@ class FlashAttentionMLAForwardSm100:
                             if const_expr(not self.pack_gqa)
                             else (0, seqlen.offset_q)
                         )
-                        mLSE_cur = cute.domain_offset(
-                            (lse_offset,), mLSE[None, head_idx, None, split_idx]
-                        )
+                        mLSE_cur = cute.domain_offset((lse_offset,), mLSE[None, head_idx, split_idx])
                 elif const_expr(not seqlen.has_cu_seqlens_q):
                     mLSE_cur = mLSE[None, head_idx, batch_idx]
                 else:
