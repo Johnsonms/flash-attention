@@ -2318,7 +2318,7 @@ def test_flash_attn_mla_absorbed_varlen(
             rtol = 2 if softcap == 0.0 else 3
 
         pack_gqa_vals = [True]
-        num_splits_vals = [1]
+        num_splits_vals = [1, 3]
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
             # SplitKV not supported on SM90 - skip this iteration
             if IS_SM90 and num_splits > 1:
