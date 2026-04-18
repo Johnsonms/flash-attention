@@ -655,6 +655,13 @@ def _flash_attn_fwd(
             assert gather_kv_indices.shape[:-1] == q.shape[:-2]
             gather_kv_length = gather_kv_indices.shape[-1]
             assert gather_kv_length % 256 == 0
+            # Topk branches in the MLA kernel hard-code n_block_min=0,
+            # n_block_max=topk_length//tile_n without using split_idx, so each
+            # split would recompute the same slice and LSE would inflate by
+            # log(num_splits). Disallow until topk partitioning is wired up.
+            assert num_splits == 1, (
+                "SplitKV (num_splits > 1) is not yet supported with gather_kv_indices"
+            )
             if min_seqlen_k is None or causal:
                 disable_sparse_kv_bitmask = False
             else:

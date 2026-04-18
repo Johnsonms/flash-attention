@@ -1892,7 +1892,7 @@ def test_flash_attn_mla_absorbed(
             q_descale, k_descale, v_descale = None, None, None
         q, k, v = [x.detach().to(dtype).requires_grad_() for x in (q_ref, k_ref, v_ref)]
         qv = qv_ref.detach().to(dtype).requires_grad_() if has_qv else None
-        out_ref, attn_ref = attention_ref(
+        out_ref, attn_ref, lse_ref = attention_ref(
             q_ref,
             k_ref,
             v_ref,
@@ -1908,6 +1908,7 @@ def test_flash_attn_mla_absorbed(
             learnable_sink=learnable_sink,
             softcap=softcap,
             gather_kv_indices=gather_kv_indices,
+            return_lse=True,
         )
         out_pt, attn_pt = attention_ref(
             q_ref,
@@ -1964,6 +1965,7 @@ def test_flash_attn_mla_absorbed(
                 pack_gqa=pack_gqa,
                 num_splits=num_splits,
                 deterministic=deterministic,
+                return_lse=True,
             )
             if is_fake_mode():
                 # no more flash_attn cutedsl calls for the rest of the loop
@@ -1971,8 +1973,15 @@ def test_flash_attn_mla_absorbed(
                 continue
             print(f"Output max diff: {(out - out_ref).abs().max().item()}")
             print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
-            # if not causal:
-            #     print(f"LSE max diff: {(lse - lse_ref).abs().max().item()}")
+            # Fully-masked rows (e.g. short seqlen_k with kv_sparsity) produce
+            # LSE = -inf on both sides; subtraction yields NaN. Compare only
+            # finite entries so the check stays focused on real numeric drift.
+            finite_mask = torch.isfinite(lse) & torch.isfinite(lse_ref)
+            if finite_mask.any():
+                lse_max_diff = (lse - lse_ref)[finite_mask].abs().max().item()
+            else:
+                lse_max_diff = 0.0
+            print(f"LSE max diff: {lse_max_diff}")
             # breakpoint()
 
             # Check that FlashAttention's numerical error is at most twice the numerical error
@@ -1980,6 +1989,11 @@ def test_flash_attn_mla_absorbed(
             assert (out - out_ref).abs().max().item() <= rtol * (
                 out_pt - out_ref
             ).abs().max().item() + fwd_atol
+            # LSE from SplitKV combine path should match the reference; if splits
+            # double-count (e.g. the topk bug where each split processes the full
+            # range), LSE inflates by log(num_splits) (≈1.099 for num_splits=3),
+            # so 0.1 cleanly separates bf16 noise (~0.03) from the bug signal.
+            assert lse_max_diff <= 0.1, f"LSE max diff {lse_max_diff} exceeds tolerance"
 
             repeats = 1000
             for iter in range(repeats):
