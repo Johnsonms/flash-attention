@@ -1946,7 +1946,7 @@ def test_flash_attn_mla_absorbed(
             rtol = 2 if softcap == 0.0 else 3
             print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
             print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
-        num_splits_vals = [1]
+        num_splits_vals = [1, 3]
         pack_gqa_vals = [True]
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
             out, lse = flash_attn_func(
