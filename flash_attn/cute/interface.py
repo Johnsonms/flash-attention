@@ -637,7 +637,6 @@ def _flash_attn_fwd(
         assert q_descale is None and k_descale is None and v_descale is None, (
             "q_descale/k_descale/v_descale are not yet supported with qv"
         )
-        assert not is_split_kv, "split kv not supported with qv"
         if page_table is not None:
             page_size = k.shape[1]
             assert gather_kv_indices is None, "paged KV + topk sparsity not yet supported together"
@@ -834,6 +833,7 @@ def _flash_attn_fwd(
                     nheads_kv=num_head_kv,
                     is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
                     disable_bitmask=disable_sparse_kv_bitmask,
+                    is_split_kv=is_split_kv,
                 )
             else:
                 fa_fwd = FlashAttentionForwardSm100(
@@ -959,8 +959,8 @@ def _flash_attn_fwd(
                 qv_call,
                 k_call,
                 v_call,
-                out.detach(),
-                lse,
+                out.detach() if not is_split_kv else out_partial,
+                lse_partial if is_split_kv else lse,
                 softmax_scale,
                 cu_seqlens_q,
                 cu_seqlens_k,
