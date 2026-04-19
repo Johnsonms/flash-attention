@@ -500,10 +500,10 @@ def _flash_attn_fwd(
     if intra_wg_overlap is None:
         intra_wg_overlap = fwd_cfg.intra_wg_overlap
 
-    # TODO: fix GQA + SplitKV + non-varlen
-    if pack_gqa and num_splits != 1 and cu_seqlens_q is None:
+    # TODO: fix non-MLA GQA + SplitKV + non-varlen. MLA (qv is not None) supports this path.
+    if pack_gqa and num_splits != 1 and cu_seqlens_q is None and qv is None:
         pack_gqa = False
-    
+
     if pack_gqa and qv is not None and 128 % qhead_per_kvhead != 0:
         pack_gqa = False
 
@@ -529,9 +529,16 @@ def _flash_attn_fwd(
         num_splits = num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, 128)
 
     # SplitKV uses float32 partial output, which doubles the O buffer size
-    # in shared memory, causing OOM for diff-headdim (192, 128)
-    if arch // 10 in [10, 11] and head_dim != head_dim_v and num_splits > 1:
-        if num_n_blocks >= 64 and head_dim_v != 512:
+    # in shared memory, causing OOM for diff-headdim (192, 128). MLA
+    # (head_dim_v=512) has its own Phase 3 SplitKV kernel path with a
+    # SMEM budget tuned for head_dim_v=512, so fall through for MLA.
+    if (
+        arch // 10 in [10, 11]
+        and head_dim != head_dim_v
+        and num_splits > 1
+        and head_dim_v != 512
+    ):
+        if num_n_blocks >= 64:
             tile_n = 64
             num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n
             num_splits = num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, 128)
@@ -637,7 +644,6 @@ def _flash_attn_fwd(
         assert q_descale is None and k_descale is None and v_descale is None, (
             "q_descale/k_descale/v_descale are not yet supported with qv"
         )
-        assert not is_split_kv, "split kv not supported with qv"
         if page_table is not None:
             page_size = k.shape[1]
             assert gather_kv_indices is None, "paged KV + topk sparsity not yet supported together"
@@ -834,6 +840,7 @@ def _flash_attn_fwd(
                     nheads_kv=num_head_kv,
                     is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
                     disable_bitmask=disable_sparse_kv_bitmask,
+                    is_split_kv=is_split_kv,
                 )
             else:
                 fa_fwd = FlashAttentionForwardSm100(
@@ -959,8 +966,8 @@ def _flash_attn_fwd(
                 qv_call,
                 k_call,
                 v_call,
-                out.detach(),
-                lse,
+                out.detach() if not is_split_kv else out_partial,
+                lse_partial if is_split_kv else lse,
                 softmax_scale,
                 cu_seqlens_q,
                 cu_seqlens_k,

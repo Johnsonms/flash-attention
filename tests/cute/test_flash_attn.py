@@ -1892,7 +1892,7 @@ def test_flash_attn_mla_absorbed(
             q_descale, k_descale, v_descale = None, None, None
         q, k, v = [x.detach().to(dtype).requires_grad_() for x in (q_ref, k_ref, v_ref)]
         qv = qv_ref.detach().to(dtype).requires_grad_() if has_qv else None
-        out_ref, attn_ref = attention_ref(
+        out_ref, attn_ref, lse_ref = attention_ref(
             q_ref,
             k_ref,
             v_ref,
@@ -1908,6 +1908,7 @@ def test_flash_attn_mla_absorbed(
             learnable_sink=learnable_sink,
             softcap=softcap,
             gather_kv_indices=gather_kv_indices,
+            return_lse=True,
         )
         out_pt, attn_pt = attention_ref(
             q_ref,
@@ -1946,7 +1947,7 @@ def test_flash_attn_mla_absorbed(
             rtol = 2 if softcap == 0.0 else 3
             print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
             print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
-        num_splits_vals = [1]
+        num_splits_vals = [1, 3]
         pack_gqa_vals = [True]
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
             out, lse = flash_attn_func(
@@ -1964,6 +1965,7 @@ def test_flash_attn_mla_absorbed(
                 pack_gqa=pack_gqa,
                 num_splits=num_splits,
                 deterministic=deterministic,
+                return_lse=True,
             )
             if is_fake_mode():
                 # no more flash_attn cutedsl calls for the rest of the loop
@@ -1971,8 +1973,15 @@ def test_flash_attn_mla_absorbed(
                 continue
             print(f"Output max diff: {(out - out_ref).abs().max().item()}")
             print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
-            # if not causal:
-            #     print(f"LSE max diff: {(lse - lse_ref).abs().max().item()}")
+            # Fully-masked rows (e.g. short seqlen_k with kv_sparsity) produce
+            # LSE = -inf on both sides; subtraction yields NaN. Compare only
+            # finite entries so the check stays focused on real numeric drift.
+            finite_mask = torch.isfinite(lse) & torch.isfinite(lse_ref)
+            if finite_mask.any():
+                lse_max_diff = (lse - lse_ref)[finite_mask].abs().max().item()
+            else:
+                lse_max_diff = 0.0
+            print(f"LSE max diff: {lse_max_diff}")
             # breakpoint()
 
             # Check that FlashAttention's numerical error is at most twice the numerical error
@@ -1980,6 +1989,11 @@ def test_flash_attn_mla_absorbed(
             assert (out - out_ref).abs().max().item() <= rtol * (
                 out_pt - out_ref
             ).abs().max().item() + fwd_atol
+            # LSE from SplitKV combine path should match the reference; if splits
+            # double-count (e.g. the topk bug where each split processes the full
+            # range), LSE inflates by log(num_splits) (≈1.099 for num_splits=3),
+            # so 0.1 cleanly separates bf16 noise (~0.03) from the bug signal.
+            assert lse_max_diff <= 0.1, f"LSE max diff {lse_max_diff} exceeds tolerance"
 
             repeats = 1000
             for iter in range(repeats):
@@ -2248,11 +2262,12 @@ def test_flash_attn_mla_absorbed_varlen(
             query_unused_mask=query_unused_mask,
             key_unused_mask=key_unused_mask,
         )
-        # unpad gather_kv_indices
+        # Pre-compute indices_q once (reused for gather_kv_indices and for
+        # padding kernel lse back to (batch, nheads, seqlen) for comparison).
+        _, indices_q, _, _, _ = unpad_input(
+            q, query_padding_mask, query_unused_mask
+        )
         if kv_sparsity:
-            _, indices_q, _, _, _ = unpad_input(
-                q, query_padding_mask, query_unused_mask
-            )
             gather_kv_indices_unpad = rearrange(gather_kv_indices, "b s ... -> (b s) ...")[indices_q]
         else:
             gather_kv_indices_unpad = None
@@ -2268,7 +2283,7 @@ def test_flash_attn_mla_absorbed_varlen(
             x.detach().to(dtype).requires_grad_() for x in (q_unpad, k_unpad, v_unpad)
         ]
 
-        out_ref, attn_ref = attention_ref(
+        out_ref, attn_ref, lse_ref = attention_ref(
             q_ref,
             k_ref,
             v_ref,
@@ -2284,6 +2299,7 @@ def test_flash_attn_mla_absorbed_varlen(
             learnable_sink=learnable_sink,
             softcap=softcap,
             gather_kv_indices=gather_kv_indices,
+            return_lse=True,
         )
         out_pt, attn_pt = attention_ref(
             q_ref,
@@ -2318,7 +2334,7 @@ def test_flash_attn_mla_absorbed_varlen(
             rtol = 2 if softcap == 0.0 else 3
 
         pack_gqa_vals = [True]
-        num_splits_vals = [1]
+        num_splits_vals = [1, 3]
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
             # SplitKV not supported on SM90 - skip this iteration
             if IS_SM90 and num_splits > 1:
@@ -2343,6 +2359,7 @@ def test_flash_attn_mla_absorbed_varlen(
                 pack_gqa=pack_gqa,
                 deterministic=deterministic,
                 gather_kv_indices=gather_kv_indices_unpad if unpad_q else gather_kv_indices,
+                return_lse=True,
             )
             out = output_pad_fn(out_unpad) if unpad_q else out_unpad
             if is_fake_mode():
@@ -2363,15 +2380,36 @@ def test_flash_attn_mla_absorbed_varlen(
                 out_pt_cmp = out_pt.clone().masked_fill_(~seqused_mask, 0.0)
             print(f"Output max diff: {(out_cmp - out_ref_cmp).abs().max().item()}")
             print(f"Output mean diff: {(out_cmp - out_ref_cmp).abs().mean().item()}")
-            # if not causal:
-            #     print(f"LSE max diff: {(lse - lse_ref).abs().max().item()}")
-            # breakpoint()
+
+            # Kernel lse shape: unpad_q -> (nheads, total_q); else (batch, nheads, seqlen_q).
+            # Compare on valid Q positions only; positions beyond seqused_q may be unwritten.
+            if unpad_q:
+                lse_flat = rearrange(lse, "h t -> t h")  # (total_q, nheads)
+                lse_ref_flat = rearrange(lse_ref, "b h s -> (b s) h")[indices_q]
+            else:
+                lse_flat = rearrange(lse, "b h s -> (b s) h")
+                lse_ref_flat = rearrange(lse_ref, "b h s -> (b s) h")
+                if seqused_q is not None:
+                    valid = (torch.arange(seqlen_q, device=device)[None, :] < seqused_q[:, None])
+                    valid = rearrange(valid, "b s -> (b s)")
+                    lse_flat = lse_flat[valid]
+                    lse_ref_flat = lse_ref_flat[valid]
+            finite_mask = torch.isfinite(lse_flat) & torch.isfinite(lse_ref_flat)
+            if finite_mask.any():
+                lse_max_diff = (lse_flat - lse_ref_flat)[finite_mask].abs().max().item()
+            else:
+                lse_max_diff = 0.0
+            print(f"LSE max diff: {lse_max_diff}")
 
             # Check that FlashAttention's numerical error is at most 3x the numerical error
             # of a Pytorch implementation.
             assert (out_cmp - out_ref_cmp).abs().max().item() <= rtol * (
                 out_pt_cmp - out_ref_cmp
             ).abs().max().item() + fwd_atol
+            # Varlen SplitKV combine path: mLSE is 3D (num_splits, num_head, total_q);
+            # Bug A (mis-indexed 4D coord) would corrupt LSE layout. Tolerance 0.1
+            # separates bf16 noise (~0.03) from log(num_splits)~=1.1 bug signal.
+            assert lse_max_diff <= 0.1, f"Varlen LSE max diff {lse_max_diff} exceeds tolerance"
 
             repeats = 1000
             for iter in range(repeats):
@@ -2412,6 +2450,7 @@ def test_flash_attn_mla_absorbed_varlen(
                 assert torch.equal(out_cmp, out2), f"non-deterministic with max diff = {(out_cmp - out2).abs().max().item()} on {iter=}"
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("num_splits", [1, 3])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
@@ -2423,7 +2462,7 @@ def test_flash_attn_mla_absorbed_varlen(
     ],
 )
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_mla_paged(seqlen_q, seqlen_k, causal, dtype):
+def test_flash_attn_mla_paged(seqlen_q, seqlen_k, causal, num_splits, dtype):
     """Test paged KV cache with MLA absorbed shape (d=64, dv=512)."""
     if not IS_SM100:
         pytest.skip("MLA paged KV only supported on SM100")
@@ -2450,11 +2489,13 @@ def test_flash_attn_mla_paged(seqlen_q, seqlen_k, causal, dtype):
     )
 
     # Non-paged reference
-    out_ref, _ = flash_attn_varlen_func(
+    out_ref, lse_ref = flash_attn_varlen_func(
         q, k, v, qv=qv,
         cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
         max_seqlen_q=seqlen_q, max_seqlen_k=seqlen_k,
         causal=causal,
+        num_splits=num_splits,
+        return_lse=True,
     )
 
     # Create paged K/V cache
@@ -2479,12 +2520,14 @@ def test_flash_attn_mla_paged(seqlen_q, seqlen_k, causal, dtype):
     seqused_k = torch.full((batch_size,), seqlen_k, dtype=torch.int32, device=device)
 
     # Paged output
-    out, _ = flash_attn_varlen_func(
+    out, lse = flash_attn_varlen_func(
         q, k_paged, v_paged, qv=qv,
         cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=None,
         max_seqlen_q=seqlen_q, max_seqlen_k=None,
         seqused_k=seqused_k, page_table=page_table,
         causal=causal,
+        num_splits=num_splits,
+        return_lse=True,
     )
 
     if is_fake_mode():
@@ -2493,9 +2536,13 @@ def test_flash_attn_mla_paged(seqlen_q, seqlen_k, causal, dtype):
     print(f"Output max diff: {(out - out_ref).abs().max().item()}")
     print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
     assert torch.equal(out, out_ref)
+    # Paged + SplitKV combine path must match non-paged + SplitKV exactly;
+    # deterministic inputs and identical num_splits make bitwise equality the right bar.
+    assert torch.equal(lse, lse_ref)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("num_splits", [1, 3])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("page_size", [16, 64])
 @pytest.mark.parametrize(
@@ -2507,7 +2554,7 @@ def test_flash_attn_mla_paged(seqlen_q, seqlen_k, causal, dtype):
     ],
 )
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_mla_paged_cpasync(seqlen_q, seqlen_k, page_size, causal, dtype):
+def test_flash_attn_mla_paged_cpasync(seqlen_q, seqlen_k, page_size, causal, num_splits, dtype):
     """Test paged KV cache with MLA using cp.async path (page_size != tile_n=128)."""
     if not IS_SM100:
         pytest.skip("MLA paged KV only supported on SM100")
@@ -2533,11 +2580,13 @@ def test_flash_attn_mla_paged_cpasync(seqlen_q, seqlen_k, page_size, causal, dty
     )
 
     # Non-paged reference
-    out_ref, _ = flash_attn_varlen_func(
+    out_ref, lse_ref = flash_attn_varlen_func(
         q, k, v, qv=qv,
         cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
         max_seqlen_q=seqlen_q, max_seqlen_k=seqlen_k,
         causal=causal,
+        num_splits=num_splits,
+        return_lse=True,
     )
 
     # Create paged K/V cache
@@ -2562,12 +2611,14 @@ def test_flash_attn_mla_paged_cpasync(seqlen_q, seqlen_k, page_size, causal, dty
     seqused_k = torch.full((batch_size,), seqlen_k, dtype=torch.int32, device=device)
 
     # Paged output (triggers cp.async path because page_size != 128)
-    out, _ = flash_attn_varlen_func(
+    out, lse = flash_attn_varlen_func(
         q, k_paged, v_paged, qv=qv,
         cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=None,
         max_seqlen_q=seqlen_q, max_seqlen_k=None,
         seqused_k=seqused_k, page_table=page_table,
         causal=causal,
+        num_splits=num_splits,
+        return_lse=True,
     )
 
     if is_fake_mode():
@@ -2575,4 +2626,6 @@ def test_flash_attn_mla_paged_cpasync(seqlen_q, seqlen_k, page_size, causal, dty
 
     print(f"Output max diff: {(out - out_ref).abs().max().item()}")
     print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
+    print(f"LSE max diff: {(lse - lse_ref).abs().max().item()}")
     assert torch.equal(out, out_ref)
+    assert torch.equal(lse, lse_ref)
