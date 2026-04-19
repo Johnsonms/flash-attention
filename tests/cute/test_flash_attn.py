@@ -2426,6 +2426,7 @@ def test_flash_attn_mla_absorbed_varlen(
                 assert torch.equal(out_cmp, out2), f"non-deterministic with max diff = {(out_cmp - out2).abs().max().item()} on {iter=}"
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("num_splits", [1, 3])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
@@ -2437,7 +2438,7 @@ def test_flash_attn_mla_absorbed_varlen(
     ],
 )
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_mla_paged(seqlen_q, seqlen_k, causal, dtype):
+def test_flash_attn_mla_paged(seqlen_q, seqlen_k, causal, num_splits, dtype):
     """Test paged KV cache with MLA absorbed shape (d=64, dv=512)."""
     if not IS_SM100:
         pytest.skip("MLA paged KV only supported on SM100")
@@ -2469,6 +2470,7 @@ def test_flash_attn_mla_paged(seqlen_q, seqlen_k, causal, dtype):
         cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
         max_seqlen_q=seqlen_q, max_seqlen_k=seqlen_k,
         causal=causal,
+        num_splits=num_splits,
     )
 
     # Create paged K/V cache
@@ -2499,6 +2501,7 @@ def test_flash_attn_mla_paged(seqlen_q, seqlen_k, causal, dtype):
         max_seqlen_q=seqlen_q, max_seqlen_k=None,
         seqused_k=seqused_k, page_table=page_table,
         causal=causal,
+        num_splits=num_splits,
     )
 
     if is_fake_mode():
@@ -2510,6 +2513,7 @@ def test_flash_attn_mla_paged(seqlen_q, seqlen_k, causal, dtype):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("num_splits", [1, 3])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("page_size", [16, 64])
 @pytest.mark.parametrize(
@@ -2521,7 +2525,7 @@ def test_flash_attn_mla_paged(seqlen_q, seqlen_k, causal, dtype):
     ],
 )
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_mla_paged_cpasync(seqlen_q, seqlen_k, page_size, causal, dtype):
+def test_flash_attn_mla_paged_cpasync(seqlen_q, seqlen_k, page_size, causal, num_splits, dtype):
     """Test paged KV cache with MLA using cp.async path (page_size != tile_n=128)."""
     if not IS_SM100:
         pytest.skip("MLA paged KV only supported on SM100")
@@ -2552,6 +2556,7 @@ def test_flash_attn_mla_paged_cpasync(seqlen_q, seqlen_k, page_size, causal, dty
         cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
         max_seqlen_q=seqlen_q, max_seqlen_k=seqlen_k,
         causal=causal,
+        num_splits=num_splits,
     )
 
     # Create paged K/V cache
@@ -2582,6 +2587,7 @@ def test_flash_attn_mla_paged_cpasync(seqlen_q, seqlen_k, page_size, causal, dty
         max_seqlen_q=seqlen_q, max_seqlen_k=None,
         seqused_k=seqused_k, page_table=page_table,
         causal=causal,
+        num_splits=num_splits,
     )
 
     if is_fake_mode():
