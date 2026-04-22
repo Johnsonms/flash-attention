@@ -178,9 +178,7 @@ class BlackwellFusedMultiHeadAttentionForward:
     ):
         # Keep parity with FlashAttentionForwardSm100.__call__ interface.
         # (TODO@wangsiyu) Implement these features.
-        assert mSeqUsedQ is None and mSeqUsedK is None, (
-            "SM100 forward with head_dim=256 does not support seqused_q/seqused_k"
-        )
+        assert mSeqUsedQ is None, "SM100 forward with head_dim=256 does not support seqused_q"
         assert learnable_sink is None, (
             "SM100 forward with head_dim=256 does not support learnable_sink"
         )
@@ -334,6 +332,13 @@ class BlackwellFusedMultiHeadAttentionForward:
             v = cute.make_tensor(v_tensor.iterator, v_layout)
             page_table = None
             max_seqlen_k_paged = None
+        if cutlass.const_expr(mSeqUsedK is not None):
+            seqused_k = cute.make_tensor(
+                mSeqUsedK.iterator,
+                cute.make_layout((b,), stride=(1,)),
+            )
+        else:
+            seqused_k = None
         # (s, d, ((h_r, h_k), b))
         o_layout = cute.make_layout(
             (s_q_total, d, ((h_r, h_k), b)),
@@ -532,6 +537,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             scale_softmax,
             scale_output,
             page_table,
+            seqused_k,
             max_seqlen_k_paged,
             window_size_left,
             window_size_right,
@@ -569,6 +575,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         scale_softmax: Float32,
         scale_output: Float32,
         mPageTable: Optional[cute.Tensor],
+        mSeqUsedK: Optional[cute.Tensor],
         max_seqlen_k: Optional[Int32],
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
@@ -812,7 +819,11 @@ class BlackwellFusedMultiHeadAttentionForward:
                 batch_coord = curr_block_coord[2][1]
                 seqlen_q = mQ_qdl.shape[0]
                 seqlen_k = (
-                    mK_kdl.shape[0] if cutlass.const_expr(mPageTable is None) else max_seqlen_k
+                    mSeqUsedK[batch_coord]
+                    if cutlass.const_expr(mSeqUsedK is not None)
+                    else (
+                        mK_kdl.shape[0] if cutlass.const_expr(mPageTable is None) else max_seqlen_k
+                    )
                 )
                 cuseqlen_q = Int32(0)
                 cuseqlen_k = Int32(0)
@@ -839,6 +850,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                         mma_block_coord[0],
                         seqlen_q,
                     )
+                continue_cond = continue_cond or seqlen_k <= 0
                 if not continue_cond:
                     mQ_qdl_ = cute.domain_offset(cute.select(block_offset, mode=[0, 2, 3]), mQ_qdl)
                     # Local tile partition global tensors
@@ -1047,11 +1059,15 @@ class BlackwellFusedMultiHeadAttentionForward:
                     curr_block_coord[2],
                 )
                 continue_cond = False
+                batch_coord = curr_block_coord[2][1]
                 seqlen_q = mQ_qdl.shape[0]
                 seqlen_k = (
-                    mK_kdl.shape[0] if cutlass.const_expr(mPageTable is None) else max_seqlen_k
+                    mSeqUsedK[batch_coord]
+                    if cutlass.const_expr(mSeqUsedK is not None)
+                    else (
+                        mK_kdl.shape[0] if cutlass.const_expr(mPageTable is None) else max_seqlen_k
+                    )
                 )
-                batch_coord = curr_block_coord[2][1]
                 if cutlass.const_expr(cum_seqlen_q is not None):
                     cuseqlen_q = cum_seqlen_q[batch_coord]
                     seqlen_q = cum_seqlen_q[batch_coord + 1] - cuseqlen_q
@@ -1060,6 +1076,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                         mma_block_coord[0],
                         seqlen_q,
                     )
+                continue_cond = continue_cond or seqlen_k <= 0
 
                 if not continue_cond:
                     if cutlass.const_expr(cum_seqlen_k is not None):
@@ -1301,7 +1318,11 @@ class BlackwellFusedMultiHeadAttentionForward:
                 continue_cond = False
                 seqlen_q = mQ_qdl.shape[0]
                 seqlen_k = (
-                    mK_kdl.shape[0] if cutlass.const_expr(mPageTable is None) else max_seqlen_k
+                    mSeqUsedK[batch_coord]
+                    if cutlass.const_expr(mSeqUsedK is not None)
+                    else (
+                        mK_kdl.shape[0] if cutlass.const_expr(mPageTable is None) else max_seqlen_k
+                    )
                 )
                 cuseqlen_q = Int32(0)
                 if cutlass.const_expr(cum_seqlen_q is not None):
@@ -1312,6 +1333,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                         mma_block_coord[0],
                         seqlen_q,
                     )
+                continue_cond = continue_cond or seqlen_k <= 0
                 if not continue_cond:
                     if cutlass.const_expr(cum_seqlen_k is not None):
                         cuseqlen_k = cum_seqlen_k[batch_coord]
@@ -1414,7 +1436,11 @@ class BlackwellFusedMultiHeadAttentionForward:
                 batch_coord = curr_block_coord[2][1]
                 seqlen_q = mQ_qdl.shape[0]
                 seqlen_k = (
-                    mK_kdl.shape[0] if cutlass.const_expr(mPageTable is None) else max_seqlen_k
+                    mSeqUsedK[batch_coord]
+                    if cutlass.const_expr(mSeqUsedK is not None)
+                    else (
+                        mK_kdl.shape[0] if cutlass.const_expr(mPageTable is None) else max_seqlen_k
+                    )
                 )
                 continue_cond = False
                 cuseqlen_q = Int32(0)
@@ -1426,6 +1452,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                         mma_block_coord[0],
                         seqlen_q,
                     )
+                continue_cond = continue_cond or seqlen_k <= 0
 
                 if not continue_cond:
                     if cutlass.const_expr(cum_seqlen_k is not None):
