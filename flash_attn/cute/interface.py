@@ -695,6 +695,23 @@ def _flash_attn_fwd(
         sparse_kv = None
         disable_sparse_kv_bitmask = None
 
+    # is_persistent for the hd256 2CTA path: gated on work-per-tile so persistent
+    # scheduling's per-tile overhead (cluster-rank reconstruction + grid-stride
+    # loop state) doesn't regress long-context prefill. Empirical crossover on
+    # B200 sits between seqlen_k=1K (persistent wins) and 4K (loses); gate at 2K
+    # for safety. Must be part of the compile_key so different seqlen_k regimes
+    # get separate compiled kernels.
+    hd256_is_persistent = (
+        use_dedicated_hd256_kernel
+        and not causal
+        and not local
+        and cu_seqlens_q is None
+        and seqused_q is None
+        and not is_split_kv
+        and seqlen_k is not None
+        and seqlen_k <= 2048
+    )
+
     compile_key = (
         dtype,
         head_dim,
@@ -735,6 +752,7 @@ def _flash_attn_fwd(
         gather_kv_length,
         sparse_kv,
         disable_sparse_kv_bitmask,
+        hd256_is_persistent,
         fa_logging.get_fa_log_level(),
     )
 
@@ -892,11 +910,7 @@ def _flash_attn_fwd(
                     m_block_size=tile_m,
                     n_block_size=tile_n,
                     q_stage=q_stage,
-                    is_persistent=not causal
-                        and not local
-                        and cu_seqlens_q is None
-                        and seqused_q is None
-                        and not is_split_kv,
+                    is_persistent=hd256_is_persistent,
                     score_mod=score_mod,
                     mask_mod=mask_mod,
                     has_aux_tensors=aux_tensors is not None,
