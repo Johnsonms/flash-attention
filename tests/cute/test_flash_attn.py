@@ -1924,6 +1924,211 @@ def test_flash_attn_paged_hd256_sm100_tma_gqa(nheads_kv):
     )
 
 
+@pytest.mark.parametrize("seqlen_k_per_batch", [(128, 256), (256, 384), (256, 512)])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_seqused_k_hd256_sm100(seqlen_k_per_batch):
+    """seqused_k (per-batch variable KV length) for SM100 hd256 2CTA.
+
+    Compares dense+seqused_k (padded K/V with per-batch valid lengths) against
+    the cu_seqlens_k reference (packed K/V). Both should produce the same
+    output for the valid KV positions.
+    """
+    if not IS_SM100:
+        pytest.skip("SM100-specific seqused_k hd256 test")
+    device = "cuda"
+    dtype = torch.bfloat16
+    d = 256
+    batch_size = len(seqlen_k_per_batch)
+    nheads = 16
+    nheads_kv = 16
+    seqlen_q = 128
+    max_seqlen_k = max(seqlen_k_per_batch)
+
+    torch.random.manual_seed(0)
+    q = torch.randn(batch_size * seqlen_q, nheads, d, device=device, dtype=dtype)
+    # Full padded K/V: each batch has max_seqlen_k rows but only seqlen_k_per_batch[b] are valid
+    k_full = torch.randn(batch_size * max_seqlen_k, nheads_kv, d, device=device, dtype=dtype)
+    v_full = torch.randn(batch_size * max_seqlen_k, nheads_kv, d, device=device, dtype=dtype)
+    cu_seqlens_q = torch.arange(0, batch_size + 1, dtype=torch.int32, device=device) * seqlen_q
+
+    # Reference: pack K/V to only valid rows, use cu_seqlens_k.
+    k_packed_list = [
+        k_full[b * max_seqlen_k : b * max_seqlen_k + seqlen_k_per_batch[b]]
+        for b in range(batch_size)
+    ]
+    v_packed_list = [
+        v_full[b * max_seqlen_k : b * max_seqlen_k + seqlen_k_per_batch[b]]
+        for b in range(batch_size)
+    ]
+    k_packed = torch.cat(k_packed_list, dim=0)
+    v_packed = torch.cat(v_packed_list, dim=0)
+    cu_seqlens_k_packed = torch.tensor(
+        [0] + list(__import__("itertools").accumulate(seqlen_k_per_batch)),
+        dtype=torch.int32, device=device,
+    )
+    out_ref, _ = flash_attn_varlen_func(
+        q, k_packed, v_packed,
+        cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k_packed,
+        max_seqlen_q=seqlen_q, max_seqlen_k=max_seqlen_k,
+    )
+
+    # Test: padded K/V with seqused_k.
+    # Layout K as (batch_size, max_seqlen_k, nheads_kv, d) via a reshape — cu_seqlens_q
+    # still applies on Q side; K side uses seqused_k to clip.
+    k_padded = k_full.reshape(batch_size, max_seqlen_k, nheads_kv, d)
+    v_padded = v_full.reshape(batch_size, max_seqlen_k, nheads_kv, d)
+    seqused_k = torch.tensor(seqlen_k_per_batch, dtype=torch.int32, device=device)
+    out, _ = flash_attn_varlen_func(
+        q, k_padded, v_padded,
+        cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=None,
+        max_seqlen_q=seqlen_q, max_seqlen_k=max_seqlen_k,
+        seqused_k=seqused_k,
+    )
+
+    if is_fake_mode():
+        return
+
+    print(f"seqused_k={seqlen_k_per_batch} vs cu_seqlens_k max diff: {(out - out_ref).abs().max().item()}")
+    assert torch.equal(out, out_ref), (
+        f"seqused_k output does not match cu_seqlens_k reference (seqlen_k_per_batch={seqlen_k_per_batch})"
+    )
+
+
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_paged_seqused_k_hd256_sm100():
+    """Paged KV + seqused_k combined — MLA decode pattern."""
+    if not IS_SM100:
+        pytest.skip("SM100-specific paged+seqused_k hd256 test")
+    device = "cuda"
+    dtype = torch.bfloat16
+    d = 256
+    batch_size = 2
+    nheads = 16
+    nheads_kv = 16
+    page_size = 128
+    seqlen_q = 128
+    max_seqlen_k = 512
+    # Per-batch actual KV length (each uses only a prefix of its allocated pages)
+    seqlen_k_per_batch = (256, 384)
+
+    torch.random.manual_seed(0)
+    q = torch.randn(batch_size * seqlen_q, nheads, d, device=device, dtype=dtype)
+    k_full = torch.randn(batch_size * max_seqlen_k, nheads_kv, d, device=device, dtype=dtype)
+    v_full = torch.randn(batch_size * max_seqlen_k, nheads_kv, d, device=device, dtype=dtype)
+    cu_seqlens_q = torch.arange(0, batch_size + 1, dtype=torch.int32, device=device) * seqlen_q
+
+    # Reference: cu_seqlens_k with only the valid rows.
+    k_packed = torch.cat([
+        k_full[b * max_seqlen_k : b * max_seqlen_k + seqlen_k_per_batch[b]]
+        for b in range(batch_size)
+    ])
+    v_packed = torch.cat([
+        v_full[b * max_seqlen_k : b * max_seqlen_k + seqlen_k_per_batch[b]]
+        for b in range(batch_size)
+    ])
+    import itertools
+    cu_seqlens_k_packed = torch.tensor(
+        [0] + list(itertools.accumulate(seqlen_k_per_batch)),
+        dtype=torch.int32, device=device,
+    )
+    out_ref, _ = flash_attn_varlen_func(
+        q, k_packed, v_packed,
+        cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k_packed,
+        max_seqlen_q=seqlen_q, max_seqlen_k=max_seqlen_k,
+    )
+
+    # Paged + seqused_k: K laid out as (num_pages, page_size, h_k, d); page_table maps
+    # each batch to its num_pages_per_seq pages; seqused_k clips per batch.
+    num_pages_per_seq = max_seqlen_k // page_size
+    total_pages = batch_size * num_pages_per_seq
+    k_paged = torch.zeros(total_pages, page_size, nheads_kv, d, device=device, dtype=dtype)
+    v_paged = torch.zeros(total_pages, page_size, nheads_kv, d, device=device, dtype=dtype)
+    for b in range(batch_size):
+        for s in range(max_seqlen_k):
+            pi = b * num_pages_per_seq + s // page_size
+            po = s % page_size
+            k_paged[pi, po] = k_full[b * max_seqlen_k + s]
+            v_paged[pi, po] = v_full[b * max_seqlen_k + s]
+    page_table = torch.arange(total_pages, dtype=torch.int32, device=device).reshape(
+        batch_size, num_pages_per_seq
+    )
+    seqused_k = torch.tensor(seqlen_k_per_batch, dtype=torch.int32, device=device)
+
+    out, _ = flash_attn_varlen_func(
+        q, k_paged, v_paged,
+        cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=None,
+        max_seqlen_q=seqlen_q, max_seqlen_k=max_seqlen_k,
+        seqused_k=seqused_k,
+        page_table=page_table,
+    )
+
+    if is_fake_mode():
+        return
+
+    print(f"Paged+seqused_k vs packed reference max diff: {(out - out_ref).abs().max().item()}")
+    assert torch.equal(out, out_ref), "Paged+seqused_k output does not match packed reference"
+
+
+@pytest.mark.parametrize("paged_kv", [False, True])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_seqused_k_zero_hd256_sm100(paged_kv):
+    """seqused_k=0 should return zero output / -inf LSE without hanging."""
+    if not IS_SM100:
+        pytest.skip("SM100-specific seqused_k hd256 test")
+    device = "cuda"
+    dtype = torch.bfloat16
+    d = 256
+    batch_size = 2
+    nheads = 16
+    nheads_kv = 16
+    seqlen_q = 128
+    max_seqlen_k = 128
+    seqused_k = torch.tensor([0, max_seqlen_k], dtype=torch.int32, device=device)
+    cu_seqlens_q = torch.arange(0, batch_size + 1, dtype=torch.int32, device=device) * seqlen_q
+
+    torch.random.manual_seed(0)
+    q = torch.randn(batch_size * seqlen_q, nheads, d, device=device, dtype=dtype)
+    k_dense = torch.randn(batch_size, max_seqlen_k, nheads_kv, d, device=device, dtype=dtype)
+    v_dense = torch.randn(batch_size, max_seqlen_k, nheads_kv, d, device=device, dtype=dtype)
+
+    page_table = None
+    k = k_dense
+    v = v_dense
+    if paged_kv:
+        page_size = 128
+        num_pages_per_seq = max_seqlen_k // page_size
+        total_pages = batch_size * num_pages_per_seq
+        k = torch.zeros(total_pages, page_size, nheads_kv, d, device=device, dtype=dtype)
+        v = torch.zeros(total_pages, page_size, nheads_kv, d, device=device, dtype=dtype)
+        for b in range(batch_size):
+            for s in range(max_seqlen_k):
+                pi = b * num_pages_per_seq + s // page_size
+                po = s % page_size
+                k[pi, po] = k_dense[b, s]
+                v[pi, po] = v_dense[b, s]
+        page_table = torch.arange(total_pages, dtype=torch.int32, device=device).reshape(
+            batch_size, num_pages_per_seq
+        )
+
+    out, lse = flash_attn_varlen_func(
+        q, k, v,
+        cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=None,
+        max_seqlen_q=seqlen_q, max_seqlen_k=max_seqlen_k,
+        seqused_k=seqused_k,
+        page_table=page_table,
+        return_lse=True,
+    )
+
+    if is_fake_mode():
+        return
+
+    out = out.view(batch_size, seqlen_q, nheads, d)
+    assert torch.count_nonzero(out[0]).item() == 0
+    assert torch.isneginf(lse[:, :seqlen_q]).all()
+    assert torch.isfinite(out[1]).all()
+    assert torch.isfinite(lse[:, seqlen_q:]).all()
+
+
 @pytest.mark.parametrize("head_dim", [4, 148, 288])
 def test_flash_attn_invalid_head_dim(head_dim):
     device = "cuda"

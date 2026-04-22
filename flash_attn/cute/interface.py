@@ -457,6 +457,21 @@ def _flash_attn_fwd(
     elif lse is not None:
         _validate_tensor(lse, "lse", lse_shape, torch.float32, device)
 
+    if seqused_k is not None and torch.any(seqused_k == 0):
+        zero_kv_batches = (seqused_k == 0)
+        if cu_seqlens_q is None:
+            out[zero_kv_batches].zero_()
+            if lse is not None:
+                lse[zero_kv_batches].fill_(float("-inf"))
+        else:
+            zero_batch_idx = torch.nonzero(zero_kv_batches, as_tuple=False).flatten()
+            for batch_idx in zero_batch_idx.tolist():
+                q_start = cu_seqlens_q[batch_idx].item()
+                q_end = cu_seqlens_q[batch_idx + 1].item()
+                out[q_start:q_end].zero_()
+                if lse is not None:
+                    lse[:, q_start:q_end].fill_(float("-inf"))
+
     if is_fp8:
         for t, name in ((q_descale, "q_descale"), (k_descale, "k_descale"), (v_descale, "v_descale")):
             if t is not None:
@@ -852,8 +867,8 @@ def _flash_attn_fwd(
                         "SM100 forward with head_dim=256 does not support block sparsity"
                     assert learnable_sink is None, \
                         "SM100 forward with head_dim=256 does not support learnable_sink"
-                    assert seqused_q is None and seqused_k is None, \
-                        "SM100 forward with head_dim=256 does not support seqused_q/seqused_k"
+                    assert seqused_q is None, \
+                        "SM100 forward with head_dim=256 does not support seqused_q"
                     # pack_gqa is an auto-selected optimization; disable it for hd256 kernel
                     pack_gqa = False
 
