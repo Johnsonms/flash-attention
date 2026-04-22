@@ -105,7 +105,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.cluster_shape_mn = (2, 1)
         self.tmem_warp_shape_mn = (4, 1)
         # Dedicated hd256 kernel uses fixed scheduling policy.
-        self.is_persistent = False
+        self.is_persistent = is_persistent
         self.is_causal = is_causal
         self.is_local = is_local
         self.use_semantic_trip_range = is_causal or is_local
@@ -375,6 +375,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                 (s_q, o.shape[1], o.shape[2]) if cum_seqlen_q is not None else o.shape,
                 self.cta_tiler,
                 self.is_persistent,
+                (*self.cluster_shape_mn, 1),
             )
 
         self.q_major_mode = utils.LayoutEnum.from_tensor(q).mma_major_mode()
@@ -798,7 +799,10 @@ class BlackwellFusedMultiHeadAttentionForward:
         else:
             blk_idx = cute.arch.block_idx()
             tile_sched = FmhaStaticTileScheduler(
-                tile_sched_params, blk_idx[0], blk_idx, cute.arch.grid_dim()
+                tile_sched_params,
+                blk_idx[0] // self.cluster_shape_mnk[0],
+                blk_idx,
+                cute.arch.grid_dim(),
             )
         work_tile = tile_sched.initial_work_tile_info()
 

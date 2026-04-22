@@ -265,6 +265,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                 (s_q, dq.shape[1], dq.shape[2]) if cum_seqlen_q is not None else dq.shape,
                 self.cta_tiler,
                 self.is_persistent,
+                (*self.cluster_shape_mn, 1),
             )
 
         self.q_major_mode = utils.LayoutEnum.from_tensor(q).mma_major_mode()
@@ -832,7 +833,10 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         else:
             blk_idx = cute.arch.block_idx()
             tile_sched = FmhaStaticTileScheduler(
-                tile_sched_params, blk_idx[0], blk_idx, cute.arch.grid_dim()
+                tile_sched_params,
+                blk_idx[0] // self.cluster_shape_mnk[0],
+                blk_idx,
+                cute.arch.grid_dim(),
             )
         work_tile = tile_sched.initial_work_tile_info()
 
