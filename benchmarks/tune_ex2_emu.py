@@ -86,6 +86,26 @@ def detect_sm103():
     print(f"GPU: {torch.cuda.get_device_name()}, SM{sm}, is_sm103={is_sm103}")
     return is_sm103
 
+def warn_unlocked_clocks():
+    """Warn if GPU clocks are not locked; print the command to fix it.
+
+    Clock variance across benchmark runs leads to unreliable tuning results.
+    Locking requires root/sudo, so we only warn rather than attempting it.
+    """
+    result = subprocess.run(
+        ["nvidia-smi", "--query-gpu=clocks.current.graphics,clocks.max.graphics",
+         "--format=csv,noheader,nounits"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return
+    cur, max_clk = result.stdout.strip().split(", ")
+    if cur != max_clk:
+        print(f"WARNING: GPU clocks are not locked ({cur} MHz, max {max_clk} MHz).")
+        print(f"  Benchmark results may vary between runs.")
+        print(f"  To lock clocks: sudo nvidia-smi --lock-gpu-clocks {max_clk}")
+        print()
+
 def run_benchmark(causal_flag, headdim_str, seqlen, rep=20, warmup=10):
     """Run benchmark, return (ms, tflops, mfu) or (None, None, None).
 
@@ -129,6 +149,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    warn_unlocked_clocks()
     original_src = read_file()
     config = parse_tuning_config(original_src)
 
