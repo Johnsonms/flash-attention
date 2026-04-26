@@ -1,0 +1,303 @@
+diff --git a/flash_attn/cute/sm100_hd256_2cta_fmha_backward_dkdvkernel.py b/flash_attn/cute/sm100_hd256_2cta_fmha_backward_dkdvkernel.py
+index 3e4f2a6..fc517a0 100644
+--- a/flash_attn/cute/sm100_hd256_2cta_fmha_backward_dkdvkernel.py
++++ b/flash_attn/cute/sm100_hd256_2cta_fmha_backward_dkdvkernel.py
+@@ -555,7 +555,13 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
+         # the atoms and layouts are built and threaded through but unused.
+         tma_store_op = cpasync.CopyBulkTensorTileS2GOp()
+         num_compute_wgs = self.num_compute_warps // 4
+-        epi_tile_dKV = (self.cta_tiler[1], self.cta_tiler[2] // num_compute_wgs)
++        # TMA box width is bounded by gcd(128 B, per-WG hd) — the SMEM swizzle
++        # stride for SM100. Each WG owns a single SMEM slot of this size and
++        # reuses it across (cta_tiler[2] // num_compute_wgs) // epi_cols stages.
++        epi_cols_dKV = math.gcd(
++            128 // (dK.element_type.width // 8), self.cta_tiler[2] // num_compute_wgs
++        )
++        epi_tile_dKV = (self.cta_tiler[1], epi_cols_dKV)
+         dK_layout_enum = utils.LayoutEnum.from_tensor(dK)
+         dV_layout_enum = utils.LayoutEnum.from_tensor(dV)
+         sdK_epi_layout = sm100_utils.make_smem_layout_epi(
+@@ -2687,6 +2693,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
+             dV_tma,
+             sdK_epi_layout,
+             sdV_epi_layout,
++            varlen,
+             sdOT,
+             sP,
+         )
+@@ -2806,21 +2813,48 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
+         dV_tma: cute.Tensor,
+         sdK_epi_layout: cute.ComposedLayout,
+         sdV_epi_layout: cute.ComposedLayout,
++        varlen: bool,
+         sdOT: cute.Tensor,
+         sP: cute.Tensor,
+     ):
+-        """Epilogue phase to store result from tensor memory to register, then global memory."""
++        """Epilogue phase to store result from tensor memory to register, then global memory.
++
++        Variant 3a (5/5): TMEM -> reg -> SMEM -> TMA bulk store path. SMEM aliases
++        existing scratch (sdOT for dV, sP+sdST for dK). For varlen, falls back to
++        per-thread self.store (mirrors flash_bwd_sm100.py:3837 which makes the
++        same restriction at hd=128).
++        """
+         tidx, _, _ = cute.arch.thread_idx()
+         _, K, D, HB = problem_shape
+         _, blk_coord_k, _, blk_coord_batch = blk_coord
+ 
+-        # adi: TMEM_DK, TMEM_DV
+-        tmem_copy_op = tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32))
++        num_warp_groups = self.num_compute_warps // 4
++        dp_idx = tidx % 128
++        wg_idx = (tidx % (self.num_compute_warps * self.threads_per_warp)) // 128
++        leader_warp = (cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4) == 0
++
++        # TMA epilogue tile parameters. Match the top-level (__call__): each
++        # epi_tile is (cta_tiler[1], epi_cols_dKV) with epi_cols_dKV chosen so
++        # the TMA box width is at most 128 B (SMEM swizzle constraint). For
++        # bf16/fp16 hd=256 this gives epi_cols_dKV=64 → num_epi_stages_dKV=2.
++        epi_cols_dKV = math.gcd(
++            128 // (dV.element_type.width // 8), self.cta_tiler[2] // num_warp_groups
++        )
++        num_epi_stages_dKV = (self.cta_tiler[2] // num_warp_groups) // epi_cols_dKV
++        epi_tile_dKV = (self.cta_tiler[1], epi_cols_dKV)
++        wg_tile_dKV = (self.cta_tiler[1], self.cta_tiler[2] // num_warp_groups)
++
++        # TMEM load atom: Repetition(32) matches the SM100 reference
++        # (flash_bwd_sm100.py:262 `dK_reduce_ncol = gcd(32, tile_hdim//2)`).
++        # With this Rep, the per-thread t2r reg fragment naturally has a
++        # mode-2 axis of size num_epi_stages (stride epi_cols), which we
++        # slice per stage in the loop below.
+         load_op = cute.make_copy_atom(
+-            tmem_copy_op,
++            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)),
+             self.acc_dtype,
+         )
+ 
++        # GMEM destinations for the varlen self.store fallback.
+         tdKtdK = tdKtdK[(None, None), 0, 0]
+         mdK_offset = cute.assume(blk_offset[1] * dK.stride[0], divby=64)
+         mdK = cute.make_tensor(
+@@ -2834,14 +2868,22 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
+             cute.make_identity_tensor((self.cta_tiler[1], self.cta_tiler[2])),
+         )
+ 
+-        num_warp_groups = self.num_compute_warps // 4
+-        dp_idx = tidx % 128
+-        wg_idx = (tidx % (self.num_compute_warps * self.threads_per_warp)) // 128
++        mdV_in = cute.make_tensor(
++            dV.iterator, cute.make_layout((K, self.cta_tiler[2], HB), stride=dV.stride)
++        )
++        offset_mdV = cute.assume(blk_offset[1] * mdV_in.stride[0], divby=64)
++        mdV = cute.make_tensor(mdV_in.iterator + offset_mdV, mdV_in.layout)
++        gdV = cute.local_tile(mdV, (self.cta_tiler[1], self.cta_tiler[2]), (None, None, None))
++        gdV = gdV[None, None, blk_coord_k, 0, blk_coord_batch]
++        cdV = cute.domain_offset(
++            (blk_coord_k * self.cta_tiler[1], 0),
++            cute.make_identity_tensor((self.cta_tiler[1], self.cta_tiler[2])),
++        )
++
++        tdVtdV = tdVtdV[(None, None), 0, 0]
+ 
+-        # Variant 3a (2/5): SMEM staging views over existing scratch storage.
+-        # dV stages through sdOT because final dK MMA can still be consuming
+-        # sdST when dV epilogue begins; dK stages through sP+sdST after that
+-        # MMA completes. TMA wiring lands in subsequent commits.
++        # SMEM staging views (alias dV→sdOT, dK→sP+sdST, see Phase 2.4 analysis).
++        # One epi-tile slot per WG; reused across epi stages within the loop.
+         s_epi_dK = cute.make_tensor(
+             cute.recast_ptr(sP.iterator, sdK_epi_layout.inner, dK.element_type),
+             sdK_epi_layout.outer,
+@@ -2853,68 +2895,66 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
+         sdK_per_wg = s_epi_dK[None, None, wg_idx]
+         sdV_per_wg = s_epi_dV[None, None, wg_idx]
+ 
+-        # Variant 3a (3/5): r2s tiled_copy for the per-WG SMEM slot. The atom
+-        # is independent of the TMEM-load layout — by using a separate r2s
+-        # thread layout we let the SMEM swizzle (carried by sdK/V_epi_layout)
+-        # govern element placement, rather than the TMEM-load atom's lane
+-        # mapping. With cta_tiler[1]=64 < 128 we distribute threads across
+-        # both M and N: thr (64, 2) × val (1, 128//bf16.width) → atom tile
+-        # (64, 16) for bf16 → 8 atoms per WG slot of (64, 128).
+-        num_bits_per_copy = 128
+-        bf16_vals_per_copy = num_bits_per_copy // dV.element_type.width
+-        r2s_m_thr = self.cta_tiler[1]
+-        r2s_n_thr = 128 // r2s_m_thr
+-        r2s_thr_layout = cute.make_ordered_layout((r2s_m_thr, r2s_n_thr), order=(1, 0))
+-        r2s_val_layout = cute.make_ordered_layout((1, bf16_vals_per_copy), order=(1, 0))
+-        r2s_copy_atom_dV = cute.make_copy_atom(
+-            cute.nvgpu.CopyUniversalOp(), dV.element_type, num_bits_per_copy=num_bits_per_copy,
+-        )
+-        r2s_copy_atom_dK = cute.make_copy_atom(
+-            cute.nvgpu.CopyUniversalOp(), dK.element_type, num_bits_per_copy=num_bits_per_copy,
+-        )
+-        tiled_copy_r2s_dV = cute.make_tiled_copy_tv(r2s_copy_atom_dV, r2s_thr_layout, r2s_val_layout)
+-        tiled_copy_r2s_dK = cute.make_tiled_copy_tv(r2s_copy_atom_dK, r2s_thr_layout, r2s_val_layout)
+-        thr_copy_r2s_dV = tiled_copy_r2s_dV.get_slice(dp_idx)
+-        thr_copy_r2s_dK = tiled_copy_r2s_dK.get_slice(dp_idx)
+-        tdV_sdV_r2s = thr_copy_r2s_dV.partition_D(sdV_per_wg)
+-        tdK_sdK_r2s = thr_copy_r2s_dK.partition_D(sdK_per_wg)
+-
++        # Auto-derived r2s atoms — match the per-stage t2r layout so each
++        # thread's reg-to-SMEM mapping aligns with the SMEM swizzle that TMA
++        # expects. Mirrors flash_bwd_sm100.py:3924 / sm100_utils.get_smem_store_op.
+         tiled_t2r_dK = tcgen05.make_tmem_copy(load_op, tdKtdK)
+         thread_t2r_dK = tiled_t2r_dK.get_slice(dp_idx)
+-
+-        tTR_cdK = thread_t2r_dK.partition_D(cdK)
+-        tTR_cdK = split_wg(tTR_cdK, num_warp_groups, wg_idx)
+-        tTR_gdK = thread_t2r_dK.partition_D(gdK)
+-        tTR_gdK = split_wg(tTR_gdK, num_warp_groups, wg_idx)
+-        tTR_rdK = cute.make_rmem_tensor(tTR_cdK.shape, self.acc_dtype)
+-        tTR_tdK = thread_t2r_dK.partition_S(tdKtdK)
+-        tTR_tdK = split_wg(tTR_tdK, num_warp_groups, wg_idx)
+-
+-        mdV_in = cute.make_tensor(
+-            dV.iterator, cute.make_layout((K, self.cta_tiler[2], HB), stride=dV.stride)
++        r2s_atom_dK = sm100_utils.get_smem_store_op(
++            utils.LayoutEnum.from_tensor(dK), dK.element_type, self.acc_dtype, tiled_t2r_dK,
+         )
+-        offset_mdV = cute.assume(blk_offset[1] * mdV_in.stride[0], divby=64)
+-        mdV = cute.make_tensor(mdV_in.iterator + offset_mdV, mdV_in.layout)
+-        gdV = cute.local_tile(mdV, (self.cta_tiler[1], self.cta_tiler[2]), (None, None, None))
+-        gdV = gdV[None, None, blk_coord_k, 0, blk_coord_batch]
+-
+-        cdV = cute.domain_offset(
+-            (blk_coord_k * self.cta_tiler[1], 0),
+-            cute.make_identity_tensor((self.cta_tiler[1], self.cta_tiler[2])),
+-        )
+-
+-        tdVtdV = tdVtdV[(None, None), 0, 0]
++        tiled_copy_r2s_dK = cute.make_tiled_copy_D(r2s_atom_dK, tiled_t2r_dK)
++        thr_copy_r2s_dK = tiled_copy_r2s_dK.get_slice(dp_idx)
++        tdK_sdK_r2s = thr_copy_r2s_dK.partition_D(sdK_per_wg)
+ 
+         tiled_t2r_dV = tcgen05.make_tmem_copy(load_op, tdVtdV)
+         thread_t2r_dV = tiled_t2r_dV.get_slice(dp_idx)
++        r2s_atom_dV = sm100_utils.get_smem_store_op(
++            utils.LayoutEnum.from_tensor(dV), dV.element_type, self.acc_dtype, tiled_t2r_dV,
++        )
++        tiled_copy_r2s_dV = cute.make_tiled_copy_D(r2s_atom_dV, tiled_t2r_dV)
++        thr_copy_r2s_dV = tiled_copy_r2s_dV.get_slice(dp_idx)
++        tdV_sdV_r2s = thr_copy_r2s_dV.partition_D(sdV_per_wg)
++
++        # Full-tile T2R partitions (per WG). Will be sliced per epi_stage in the loop.
++        tTR_cdK = split_wg(thread_t2r_dK.partition_D(cdK), num_warp_groups, wg_idx)
++        tTR_gdK = split_wg(thread_t2r_dK.partition_D(gdK), num_warp_groups, wg_idx)
++        tTR_tdK = split_wg(thread_t2r_dK.partition_S(tdKtdK), num_warp_groups, wg_idx)
++        tTR_rdK = cute.make_rmem_tensor(tTR_cdK.shape, self.acc_dtype)
+ 
+-        tTR_cdV = thread_t2r_dV.partition_D(cdV)
+-        tTR_cdV = split_wg(tTR_cdV, num_warp_groups, wg_idx)
+-        tTR_gdV = thread_t2r_dV.partition_D(gdV)
+-        tTR_gdV = split_wg(tTR_gdV, num_warp_groups, wg_idx)
++        tTR_cdV = split_wg(thread_t2r_dV.partition_D(cdV), num_warp_groups, wg_idx)
++        tTR_gdV = split_wg(thread_t2r_dV.partition_D(gdV), num_warp_groups, wg_idx)
++        tTR_tdV = split_wg(thread_t2r_dV.partition_S(tdVtdV), num_warp_groups, wg_idx)
+         tTR_rdV = cute.make_rmem_tensor(tTR_cdV.shape, self.acc_dtype)
+-        tTR_tdV = thread_t2r_dV.partition_S(tdVtdV)
+-        tTR_tdV = split_wg(tTR_tdV, num_warp_groups, wg_idx)
++
++        # GMEM TMA destinations (built once outside loop), gated on not-varlen.
++        if cutlass.const_expr(not varlen):
++            mdV_tma_3d = cute.make_tensor(
++                dV_tma.iterator,
++                cute.make_layout((K, self.cta_tiler[2], HB), stride=dV_tma.stride),
++            )
++            mdV_tma_cur = mdV_tma_3d[None, None, blk_coord_batch]
++            gdV_tma = cute.local_tile(mdV_tma_cur, wg_tile_dKV, (blk_coord_k, wg_idx))
++            gdV_tma_epi = cute.local_tile(gdV_tma, epi_tile_dKV, (0, None))
++
++            mdK_tma_3d = cute.make_tensor(
++                dK_tma.iterator,
++                cute.make_layout((K, self.cta_tiler[2], HB), stride=dK_tma.stride),
++            )
++            mdK_tma_cur = mdK_tma_3d[None, None, blk_coord_batch]
++            gdK_tma = cute.local_tile(mdK_tma_cur, wg_tile_dKV, (blk_coord_k, wg_idx))
++            gdK_tma_epi = cute.local_tile(gdK_tma, epi_tile_dKV, (0, None))
++
++            tdV_sdV_tma, tdV_gdV_tma = cpasync.tma_partition(
++                tma_atom_dV, 0, cute.make_layout(1),
++                cute.group_modes(sdV_per_wg, 0, 2),
++                cute.group_modes(gdV_tma_epi, 0, 2),
++            )
++            tdK_sdK_tma, tdK_gdK_tma = cpasync.tma_partition(
++                tma_atom_dK, 0, cute.make_layout(1),
++                cute.group_modes(sdK_per_wg, 0, 2),
++                cute.group_modes(gdK_tma_epi, 0, 2),
++            )
+ 
+         dkdv_handle = mma_compute_dKdV_consumer.wait_and_advance()
+ 
+@@ -2922,11 +2962,37 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
+             cute.copy(tiled_t2r_dV, tTR_tdV, tTR_rdV)
+             tTR_rdV_cast = cute.make_rmem_tensor(tTR_rdV.shape, dV.element_type)
+             tTR_rdV_cast.store(tTR_rdV.load().to(dV.element_type))
+-            tTR_rdV_r2s = cute.make_tensor(tTR_rdV_cast.iterator, tdV_sdV_r2s.shape)
+-            cute.copy(thr_copy_r2s_dV, tTR_rdV_r2s, tdV_sdV_r2s)
+-            cute.arch.fence_view_async_shared()
+-            cute.arch.barrier(barrier_id=5 + wg_idx, number_of_threads=128)
+-            self.store(tTR_gdV, tTR_rdV, tTR_cdV, (K, D))
++
++            for epi_stage in cutlass.range_constexpr(num_epi_stages_dKV):
++                # Per-stage slicing:
++                # - tTR_rdV_cast layout `((32,1),1,2):((1,0),0,32)` → mode 2 is
++                #   the epi_stage axis (stride = epi_cols elements). Slicing
++                #   `[None, None, epi_stage]` selects 32 reg elements per
++                #   thread for this stage.
++                # - tdV_sdV_r2s layout `((1,32),1,(2,2)):((0,1),0,(32,0))` for
++                #   the (M, epi_cols) per-WG SMEM slot. Mode 2 is compound
++                #   (outer = num_epi_stages, inner = lane-broadcast). Slice
++                #   `[None, None, (epi_stage, None)]` selects the outer index
++                #   for this stage and keeps the broadcast inner axis.
++                # - Pass `partition.layout` (not `.shape`) to make_tensor so
++                #   the broadcast inner stride 0 aliases reg elements
++                #   correctly (no OOB on the 32-elem reg slice).
++                tTR_rdV_stage = tTR_rdV_cast[None, None, epi_stage]
++                tdV_sdV_r2s_stage = tdV_sdV_r2s[None, None, (epi_stage, None)]
++                tTR_rdV_r2s = cute.make_tensor(tTR_rdV_stage.iterator, tdV_sdV_r2s_stage.layout)
++                cute.copy(thr_copy_r2s_dV, tTR_rdV_r2s, tdV_sdV_r2s_stage)
++                cute.arch.fence_view_async_shared()
++                cute.arch.barrier(barrier_id=5 + wg_idx, number_of_threads=128)
++
++                if cutlass.const_expr(not varlen):
++                    if leader_warp:
++                        cute.copy(tma_atom_dV, tdV_sdV_tma, tdV_gdV_tma[None, epi_stage])
++                        cute.arch.cp_async_bulk_commit_group()
++                    # Wait so SMEM is free for the next stage's r2s overwrite.
++                    cute.arch.cp_async_bulk_wait_group(0, read=True)
++
++            if cutlass.const_expr(varlen):
++                self.store(tTR_gdV, tTR_rdV, tTR_cdV, (K, D))
+ 
+         cute.arch.fence_view_async_tmem_load()
+         dkdv_handle.release()
+@@ -2941,11 +3007,23 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
+ 
+             tTR_rdK_cast = cute.make_rmem_tensor(tTR_rdK.shape, dK.element_type)
+             tTR_rdK_cast.store(tTR_rdK.load().to(dK.element_type))
+-            tTR_rdK_r2s = cute.make_tensor(tTR_rdK_cast.iterator, tdK_sdK_r2s.shape)
+-            cute.copy(thr_copy_r2s_dK, tTR_rdK_r2s, tdK_sdK_r2s)
+-            cute.arch.fence_view_async_shared()
+-            cute.arch.barrier(barrier_id=5 + wg_idx, number_of_threads=128)
+-            self.store(tTR_gdK, tTR_rdK, tTR_cdK, (K, D))
++
++            for epi_stage in cutlass.range_constexpr(num_epi_stages_dKV):
++                tTR_rdK_stage = tTR_rdK_cast[None, None, epi_stage]
++                tdK_sdK_r2s_stage = tdK_sdK_r2s[None, None, (epi_stage, None)]
++                tTR_rdK_r2s = cute.make_tensor(tTR_rdK_stage.iterator, tdK_sdK_r2s_stage.layout)
++                cute.copy(thr_copy_r2s_dK, tTR_rdK_r2s, tdK_sdK_r2s_stage)
++                cute.arch.fence_view_async_shared()
++                cute.arch.barrier(barrier_id=5 + wg_idx, number_of_threads=128)
++
++                if cutlass.const_expr(not varlen):
++                    if leader_warp:
++                        cute.copy(tma_atom_dK, tdK_sdK_tma, tdK_gdK_tma[None, epi_stage])
++                        cute.arch.cp_async_bulk_commit_group()
++                    cute.arch.cp_async_bulk_wait_group(0, read=True)
++
++            if cutlass.const_expr(varlen):
++                self.store(tTR_gdK, tTR_rdK, tTR_cdK, (K, D))
+ 
+         cute.arch.fence_view_async_tmem_load()
+         dkdv_handle.release()

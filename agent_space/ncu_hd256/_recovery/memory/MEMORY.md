@@ -1,0 +1,5 @@
+- [User profile](user.md) — Kernel engineer at Together.ai working on FA4 CuTeDSL kernels for Blackwell B200
+- [pdl-hd256-bwd PR + hd256-bwd-epilogue-refactor branch](project_pdl_hd256_bwd.md) — Tip `d3747c0` (squashed, off main): 2 commits = loop-reorder + Variant 3a (TMA bulk store via CTA-shared SMEM, 8/8 PASS). Pre-squash chain preserved as `hd256-bwd-epilogue-refactor-history` (`da0561b`). Lessons in `agent_space/ncu_hd256/LESSONS_VARIANT_3A.md`. Remaining: 3.1 ncu, 3.2 bench, 3.3 push+PR.
+- [FA4 hd256 bwd optimization opps (ncu)](project_hd256_bwd_optimization_opps.md) — Tensor-pipe bound, not DRAM. Two source-line hotspots: epilogue stores (71–96% of excess) + strided LSE/dpsum loads (8–14%)
+- [Commit incrementally; no giant uncommitted diffs](feedback_incremental_commits.md) — Lost 213 lines to a `git checkout` once; commit each validated step
+- [Codex implements + Claude verifies workflow](feedback_codex_claude_workflow.md) — For variant 3a + similar multi-step kernel work; handoff via markdown doc in agent_space/

@@ -1,0 +1,334 @@
+diff --git a/flash_attn/cute/interface.py b/flash_attn/cute/interface.py
+index a7d504c..7808655 100644
+--- a/flash_attn/cute/interface.py
++++ b/flash_attn/cute/interface.py
+@@ -47,7 +47,10 @@ from flash_attn.cute.flash_fwd_mla_sm100 import FlashAttentionMLAForwardSm100
+ 
+ # SM100 head_dim=256 2CTA kernel imports
+ from flash_attn.cute.sm100_hd256_2cta_fmha_forward import BlackwellFusedMultiHeadAttentionForward
+-from flash_attn.cute.sm100_hd256_2cta_fmha_backward import BlackwellFusedMultiHeadAttentionBackward
++from flash_attn.cute.sm100_hd256_2cta_fmha_backward import (
++    BlackwellFusedMultiHeadAttentionBackward,
++    BlackwellDualStreamRunner,
++)
+ 
+ from flash_attn.cute.block_sparsity import (
+     BlockSparseTensorsTorch,
+@@ -1759,8 +1762,7 @@ def _flash_attn_bwd(
+         dq_accum_tensor = dq_tensor if use_dedicated_hd256_kernel else dq_accum_tensor
+ 
+         # TODO: check @can_implement
+-        _flash_attn_bwd.compile_cache[compile_key] = cute.compile(
+-            fa_bwd_obj,
++        compile_args = (
+             q_tensor,
+             k_tensor,
+             v_tensor,
+@@ -1783,8 +1785,21 @@ def _flash_attn_bwd(
+             cute_aux_tensors,
+             sparse_tensors_compile,
+             current_stream,
+-            options="--enable-tvm-ffi",
+         )
++        if use_dedicated_hd256_kernel:
++            compiled_dq = cute.compile(
++                fa_bwd_obj.dq_callable, *compile_args, options="--enable-tvm-ffi"
++            )
++            compiled_dkdv = cute.compile(
++                fa_bwd_obj.dkdv_callable, *compile_args, options="--enable-tvm-ffi"
++            )
++            _flash_attn_bwd.compile_cache[compile_key] = BlackwellDualStreamRunner(
++                compiled_dq, compiled_dkdv, q.device.index
++            )
++        else:
++            _flash_attn_bwd.compile_cache[compile_key] = cute.compile(
++                fa_bwd_obj, *compile_args, options="--enable-tvm-ffi"
++            )
+     if not is_fake_mode():
+         dq_accum = dq if use_dedicated_hd256_kernel else dq_accum
+         _flash_attn_bwd.compile_cache[compile_key](
+diff --git a/flash_attn/cute/sm100_hd256_2cta_fmha_backward.py b/flash_attn/cute/sm100_hd256_2cta_fmha_backward.py
+index c07e3e9..5a817cc 100644
+--- a/flash_attn/cute/sm100_hd256_2cta_fmha_backward.py
++++ b/flash_attn/cute/sm100_hd256_2cta_fmha_backward.py
+@@ -10,6 +10,7 @@ Constraints:
+ """
+ 
+ import cuda.bindings.driver as cuda
++import tvm_ffi as _tvm_ffi
+ 
+ import cutlass
+ import cutlass.cute as cute
+@@ -96,6 +97,181 @@ def _as_shhb_tensor(
+     )
+ 
+ 
++def _normalize_tensors(Q, K, V, dO, lse_log2, dpsum, dQ, dK, dV, cumulative_s_q, cumulative_s_k):
++    """Shared tensor normalization: compute head counts and reshape to (B,S,H_k,H_r,D) / (S,((H_r,H_k),B))."""
++    varlen = cumulative_s_q is not None or cumulative_s_k is not None
++    q_rank = cute.rank(Q.layout)
++    k_rank = cute.rank(K.layout)
++    if cutlass.const_expr(q_rank == 5):
++        h_q = Q.shape[2] * Q.shape[3]
++    elif cutlass.const_expr(q_rank == 4):
++        h_q = Q.shape[2]
++    else:
++        h_q = Q.shape[1]
++    if cutlass.const_expr(k_rank == 5):
++        h_k = K.shape[2]
++    elif cutlass.const_expr(k_rank == 4):
++        h_k = K.shape[2]
++    else:
++        h_k = K.shape[1]
++    h_r = h_q // h_k
++    if cutlass.const_expr(cumulative_s_q is not None):
++        b = cumulative_s_q.shape[0] - 1
++    elif cutlass.const_expr(cumulative_s_k is not None):
++        b = cumulative_s_k.shape[0] - 1
++    else:
++        b = Q.shape[0]
++    Q = _as_bshkrd_tensor(Q, h_k, h_r, varlen)
++    K = _as_bshkrd_tensor(K, h_k, 1, varlen)
++    V = _as_bshkrd_tensor(V, h_k, 1, varlen)
++    dQ = _as_bshkrd_tensor(dQ, h_k, h_r, varlen)
++    dK = _as_bshkrd_tensor(dK, h_k, 1, varlen)
++    dV = _as_bshkrd_tensor(dV, h_k, 1, varlen)
++    dO = _as_bshkrd_tensor(dO, h_k, h_r, varlen)
++    scaled_LSE = _as_shhb_tensor(lse_log2, h_k, h_r, b, varlen)
++    sum_OdO = _as_shhb_tensor(dpsum, h_k, h_r, b, varlen)
++    return Q, K, V, dO, dQ, dK, dV, scaled_LSE, sum_OdO, cumulative_s_q, cumulative_s_k
++
++
++class _DQCallable:
++    """Wrapper that compiles only the dQ backward kernel with full tensor normalization."""
++
++    def __init__(self, bwd: "BlackwellFusedMultiHeadAttentionBackward"):
++        self._bwd = bwd
++
++    @cute.jit
++    def __call__(
++        self,
++        Q: cute.Tensor,
++        K: cute.Tensor,
++        V: cute.Tensor,
++        dO: cute.Tensor,
++        lse_log2: cute.Tensor,
++        dpsum: cute.Tensor,
++        dQ_accum: cute.Tensor | None,
++        dK: cute.Tensor,
++        dV: cute.Tensor,
++        scale_softmax: cutlass.Float32,
++        cumulative_s_q: cute.Tensor | None,
++        cumulative_s_k: cute.Tensor | None,
++        seqused_q: cute.Tensor | None = None,
++        seqused_k: cute.Tensor | None = None,
++        window_size_left: Int32 | None = None,
++        window_size_right: Int32 | None = None,
++        dQ_semaphore: cute.Tensor | None = None,
++        dK_semaphore: cute.Tensor | None = None,
++        dV_semaphore: cute.Tensor | None = None,
++        aux_tensors: tuple[cute.Tensor] | None = None,
++        block_sparse_tensors: cute.Tensor | None = None,
++        stream: cuda.CUstream = None,
++    ):
++        dQ = dQ_accum
++        Q, K, V, dO, dQ, dK, dV, scaled_LSE, sum_OdO, cumulative_s_q, cumulative_s_k = (
++            _normalize_tensors(Q, K, V, dO, lse_log2, dpsum, dQ, dK, dV, cumulative_s_q, cumulative_s_k)
++        )
++        self._bwd.dq_kernel(
++            Q, K, V, dQ, dO, scaled_LSE, sum_OdO, cumulative_s_q, cumulative_s_k, scale_softmax, stream
++        )
++
++
++class _DKDVCallable:
++    """Wrapper that compiles only the dK/dV backward kernel with full tensor normalization."""
++
++    def __init__(self, bwd: "BlackwellFusedMultiHeadAttentionBackward"):
++        self._bwd = bwd
++
++    @cute.jit
++    def __call__(
++        self,
++        Q: cute.Tensor,
++        K: cute.Tensor,
++        V: cute.Tensor,
++        dO: cute.Tensor,
++        lse_log2: cute.Tensor,
++        dpsum: cute.Tensor,
++        dQ_accum: cute.Tensor | None,
++        dK: cute.Tensor,
++        dV: cute.Tensor,
++        scale_softmax: cutlass.Float32,
++        cumulative_s_q: cute.Tensor | None,
++        cumulative_s_k: cute.Tensor | None,
++        seqused_q: cute.Tensor | None = None,
++        seqused_k: cute.Tensor | None = None,
++        window_size_left: Int32 | None = None,
++        window_size_right: Int32 | None = None,
++        dQ_semaphore: cute.Tensor | None = None,
++        dK_semaphore: cute.Tensor | None = None,
++        dV_semaphore: cute.Tensor | None = None,
++        aux_tensors: tuple[cute.Tensor] | None = None,
++        block_sparse_tensors: cute.Tensor | None = None,
++        stream: cuda.CUstream = None,
++    ):
++        dQ = dQ_accum
++        Q, K, V, dO, dQ, dK, dV, scaled_LSE, sum_OdO, cumulative_s_q, cumulative_s_k = (
++            _normalize_tensors(Q, K, V, dO, lse_log2, dpsum, dQ, dK, dV, cumulative_s_q, cumulative_s_k)
++        )
++        self._bwd.dkdv_kernel(
++            Q, K, V, dK, dV, dO, scaled_LSE, sum_OdO, cumulative_s_q, cumulative_s_k, scale_softmax, stream
++        )
++
++
++class BlackwellDualStreamRunner:
++    """Python-level orchestrator that runs dQ and dK/dV concurrently on two side streams.
++
++    FA4 uses TVM FFI with env-stream injection (default: null stream = 0).
++    Because FA4 cute tensors carry no __tvm_ffi_env_stream__, TVM FFI does NOT
++    override the env stream during the call; so using tvm_ffi.use_raw_stream()
++    reliably steers each compiled callable onto a dedicated side stream.
++
++    Fork/join pattern (device index = `device`):
++      main_stream (null, 0) → ev_pre → s_dq / s_dkdv (concurrent) → ev_dq / ev_dkdv → main_stream
++    """
++
++    def __init__(self, compiled_dq, compiled_dkdv, device: int):
++        self._compiled_dq = compiled_dq
++        self._compiled_dkdv = compiled_dkdv
++        self._tvm_dev = _tvm_ffi.device(f"cuda:{device}")
++        self._s_dq = None
++        self._s_dkdv = None
++        self._ev_pre = None
++        self._ev_dq = None
++        self._ev_dkdv = None
++
++    def _ensure_streams(self):
++        if self._s_dq is None:
++            _, self._s_dq = cuda.cuStreamCreate(cuda.CUstream_flags.CU_STREAM_NON_BLOCKING)
++            _, self._s_dkdv = cuda.cuStreamCreate(cuda.CUstream_flags.CU_STREAM_NON_BLOCKING)
++            _, self._ev_pre = cuda.cuEventCreate(cuda.CUevent_flags.CU_EVENT_DISABLE_TIMING)
++            _, self._ev_dq = cuda.cuEventCreate(cuda.CUevent_flags.CU_EVENT_DISABLE_TIMING)
++            _, self._ev_dkdv = cuda.cuEventCreate(cuda.CUevent_flags.CU_EVENT_DISABLE_TIMING)
++
++    def __call__(self, *args):
++        self._ensure_streams()
++        # The TVM FFI env stream for this device is the "main stream" (null stream by default).
++        env_stream_ptr = _tvm_ffi.get_raw_stream(self._tvm_dev)
++        main_stream = cuda.CUstream(env_stream_ptr)
++
++        # Fork: record event on main stream, make side streams wait for it.
++        # (bwd_preprocess ran on main_stream before we were called)
++        cuda.cuEventRecord(self._ev_pre, main_stream)
++        cuda.cuStreamWaitEvent(self._s_dq, self._ev_pre, 0)
++        cuda.cuStreamWaitEvent(self._s_dkdv, self._ev_pre, 0)
++
++        # Submit dQ kernel to s_dq.
++        with _tvm_ffi.use_raw_stream(self._tvm_dev, int(self._s_dq)):
++            self._compiled_dq(*args)
++
++        # Submit dK/dV kernel to s_dkdv (concurrent with dQ).
++        with _tvm_ffi.use_raw_stream(self._tvm_dev, int(self._s_dkdv)):
++            self._compiled_dkdv(*args)
++
++        # Join: record completion events, make main stream wait for both.
++        cuda.cuEventRecord(self._ev_dq, self._s_dq)
++        cuda.cuEventRecord(self._ev_dkdv, self._s_dkdv)
++        cuda.cuStreamWaitEvent(main_stream, self._ev_dq, 0)
++        cuda.cuStreamWaitEvent(main_stream, self._ev_dkdv, 0)
++
++
+ class BlackwellFusedMultiHeadAttentionBackward:
+     """FMHA backward class for executing CuTeDSL kernel."""
+ 
+@@ -181,6 +357,9 @@ class BlackwellFusedMultiHeadAttentionBackward:
+             self.window_size_right,
+             use_clc_scheduler=self.use_clc_scheduler,
+         )
++        # Separate callable wrappers for compiling dQ and dK/dV independently.
++        self.dq_callable = _DQCallable(self)
++        self.dkdv_callable = _DKDVCallable(self)
+ 
+     @cute.jit
+     def __call__(
+@@ -208,7 +387,7 @@ class BlackwellFusedMultiHeadAttentionBackward:
+         block_sparse_tensors: cute.Tensor | None = None,
+         stream: cuda.CUstream = None,
+     ):
+-        """Host function to launch CuTeDSL kernel."""
++        """Host function to launch CuTeDSL kernel (sequential fallback / used as compile target)."""
+         assert seqused_q is None and seqused_k is None, (
+             "SM100 backward with head_dim=256 does not support seqused_q/seqused_k"
+         )
+@@ -228,64 +407,14 @@ class BlackwellFusedMultiHeadAttentionBackward:
+             "SM100 backward with head_dim=256 expects dQ tensor at dQ_accum slot"
+         )
+         dQ = dQ_accum
+-        varlen = cumulative_s_q is not None or cumulative_s_k is not None
+-        q_rank = cute.rank(Q.layout)
+-        k_rank = cute.rank(K.layout)
+-        if cutlass.const_expr(q_rank == 5):
+-            h_q = Q.shape[2] * Q.shape[3]
+-        elif cutlass.const_expr(q_rank == 4):
+-            h_q = Q.shape[2]
+-        else:
+-            h_q = Q.shape[1]
+-        if cutlass.const_expr(k_rank == 5):
+-            h_k = K.shape[2]
+-        elif cutlass.const_expr(k_rank == 4):
+-            h_k = K.shape[2]
+-        else:
+-            h_k = K.shape[1]
+-        h_r = h_q // h_k
+-        if cutlass.const_expr(cumulative_s_q is not None):
+-            b = cumulative_s_q.shape[0] - 1
+-        elif cutlass.const_expr(cumulative_s_k is not None):
+-            b = cumulative_s_k.shape[0] - 1
+-        else:
+-            b = Q.shape[0]
+-
+-        Q = _as_bshkrd_tensor(Q, h_k, h_r, varlen)
+-        K = _as_bshkrd_tensor(K, h_k, 1, varlen)
+-        V = _as_bshkrd_tensor(V, h_k, 1, varlen)
+-        dQ = _as_bshkrd_tensor(dQ, h_k, h_r, varlen)
+-        dK = _as_bshkrd_tensor(dK, h_k, 1, varlen)
+-        dV = _as_bshkrd_tensor(dV, h_k, 1, varlen)
+-        dO = _as_bshkrd_tensor(dO, h_k, h_r, varlen)
+-        scaled_LSE = _as_shhb_tensor(lse_log2, h_k, h_r, b, varlen)
+-        sum_OdO = _as_shhb_tensor(dpsum, h_k, h_r, b, varlen)
+-
+-        # Keep original order: dQ first, then dKdV.
++        Q, K, V, dO, dQ, dK, dV, scaled_LSE, sum_OdO, cumulative_s_q, cumulative_s_k = (
++            _normalize_tensors(Q, K, V, dO, lse_log2, dpsum, dQ, dK, dV, cumulative_s_q, cumulative_s_k)
++        )
++
++        # Sequential: dQ first, then dK/dV.
+         self.dq_kernel(
+-            Q,
+-            K,
+-            V,
+-            dQ,
+-            dO,
+-            scaled_LSE,
+-            sum_OdO,
+-            cumulative_s_q,
+-            cumulative_s_k,
+-            scale_softmax,
+-            stream,
++            Q, K, V, dQ, dO, scaled_LSE, sum_OdO, cumulative_s_q, cumulative_s_k, scale_softmax, stream
+         )
+         self.dkdv_kernel(
+-            Q,
+-            K,
+-            V,
+-            dK,
+-            dV,
+-            dO,
+-            scaled_LSE,
+-            sum_OdO,
+-            cumulative_s_q,
+-            cumulative_s_k,
+-            scale_softmax,
+-            stream,
++            Q, K, V, dK, dV, dO, scaled_LSE, sum_OdO, cumulative_s_q, cumulative_s_k, scale_softmax, stream
+         )
