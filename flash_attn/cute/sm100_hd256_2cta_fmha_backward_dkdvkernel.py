@@ -548,6 +548,29 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         self.tma_copy_V_bytes = cute.size_in_bytes(V.element_type, V_smem_layout) * atom_thr_size
         self.tma_copy_dO_bytes = cute.size_in_bytes(dO.element_type, dO_smem_layout) * atom_thr_size
 
+        # Variant 3a epilogue: TMA store atoms (S2G) for dK / dV.
+        # Each compute warp group owns half the hd_v output via split_wg, so
+        # the per-WG epi tile is (cta_tiler[1], cta_tiler[2] / num_compute_wgs).
+        # SMEM staging will alias onto sP+sdST in subsequent commits; for now
+        # the atoms and layouts are built and threaded through but unused.
+        tma_store_op = cpasync.CopyBulkTensorTileS2GOp()
+        num_compute_wgs = self.num_compute_warps // 4
+        epi_tile_dKV = (self.cta_tiler[1], self.cta_tiler[2] // num_compute_wgs)
+        dK_layout_enum = utils.LayoutEnum.from_tensor(dK)
+        dV_layout_enum = utils.LayoutEnum.from_tensor(dV)
+        sdK_epi_layout = sm100_utils.make_smem_layout_epi(
+            dK.element_type, dK_layout_enum, epi_tile_dKV, num_compute_wgs,
+        )
+        sdV_epi_layout = sm100_utils.make_smem_layout_epi(
+            dV.element_type, dV_layout_enum, epi_tile_dKV, num_compute_wgs,
+        )
+        tma_atom_dK, tma_tensor_dK = cpasync.make_tiled_tma_atom(
+            tma_store_op, dK, cute.select(sdK_epi_layout, mode=[0, 1]), epi_tile_dKV,
+        )
+        tma_atom_dV, tma_tensor_dV = cpasync.make_tiled_tma_atom(
+            tma_store_op, dV, cute.select(sdV_epi_layout, mode=[0, 1]), epi_tile_dKV,
+        )
+
         @cute.struct
         class SharedStorage:
             # Pipeline barriers
@@ -674,6 +697,10 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             tma_tensor_dOT,
             dK,
             dV,
+            tma_atom_dK,
+            tma_tensor_dK,
+            tma_atom_dV,
+            tma_tensor_dV,
             scaled_LSE,
             scale_softmax,
             sum_OdO,
@@ -692,6 +719,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             P_smem_layout_staged,
             LSE_smem_layout,
             sum_OdO_smem_layout,
+            sdK_epi_layout,
+            sdV_epi_layout,
             self.tile_sched_params,
         ).launch(
             grid=bwd_grid,
@@ -725,6 +754,10 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         dOT_in: cute.Tensor,
         dK: cute.Tensor,
         dV: cute.Tensor,
+        tma_atom_dK: cute.CopyAtom,
+        dK_tma: cute.Tensor,
+        tma_atom_dV: cute.CopyAtom,
+        dV_tma: cute.Tensor,
         LSE: cute.Tensor,
         scale_softmax: cutlass.Float32,
         sum_OdO: cute.Tensor,
@@ -743,6 +776,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         P_smem_layout_staged: cute.ComposedLayout,
         LSE_smem_layout: cute.Layout,
         sum_OdO_smem_layout: cute.Layout,
+        sdK_epi_layout: cute.ComposedLayout,
+        sdV_epi_layout: cute.ComposedLayout,
         tile_sched_params: FmhaStaticTileSchedulerParams | FmhaClcDynamicTileSchedulerParams,
     ):
         """Core CuTeDSL backward kernel."""
@@ -1390,6 +1425,12 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                             varlen,
                             sK,
                             seqlen_k_cur_batch,
+                            tma_atom_dK,
+                            dK_tma,
+                            tma_atom_dV,
+                            dV_tma,
+                            sdK_epi_layout,
+                            sdV_epi_layout,
                         )
                         cute.arch.barrier(
                             barrier_id=self.epilogue_sync_bar_id,
@@ -1583,6 +1624,12 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                     varlen,
                     sK,
                     seqlen_k_cur_batch,
+                    tma_atom_dK,
+                    dK_tma,
+                    tma_atom_dV,
+                    dV_tma,
+                    sdK_epi_layout,
+                    sdV_epi_layout,
                 )
 
                 cute.arch.barrier(
@@ -2386,6 +2433,12 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         varlen: bool,
         sK: cute.Tensor,
         problem_shape_k_cur_batch: Int32,
+        tma_atom_dK: cute.CopyAtom,
+        dK_tma: cute.Tensor,
+        tma_atom_dV: cute.CopyAtom,
+        dV_tma: cute.Tensor,
+        sdK_epi_layout: cute.ComposedLayout,
+        sdV_epi_layout: cute.ComposedLayout,
     ):
         """CuTeDSL kernel for recomputing softmax and producing dk and dv."""
         tidx, _, _ = cute.arch.thread_idx()
@@ -2625,6 +2678,12 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             mma_compute_dKdV_producer,
             mma_compute_dKdV_consumer,
             problem_shape_k_cur_batch,
+            tma_atom_dK,
+            dK_tma,
+            tma_atom_dV,
+            dV_tma,
+            sdK_epi_layout,
+            sdV_epi_layout,
         )
 
         if not cutlass.const_expr(self.use_clc_scheduler):
@@ -2736,6 +2795,12 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         mma_compute_dKdV_producer,
         mma_compute_dKdV_consumer,
         problem_shape_k_cur_batch: Int32,
+        tma_atom_dK: cute.CopyAtom,
+        dK_tma: cute.Tensor,
+        tma_atom_dV: cute.CopyAtom,
+        dV_tma: cute.Tensor,
+        sdK_epi_layout: cute.ComposedLayout,
+        sdV_epi_layout: cute.ComposedLayout,
     ):
         """Epilogue phase to store result from tensor memory to register, then global memory."""
         tidx, _, _ = cute.arch.thread_idx()
