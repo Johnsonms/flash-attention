@@ -1394,6 +1394,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                             sP,
                             sLSE,
                             sdST,
+                            sdOT,
                             sSum_OdO,
                             dK,
                             dV,
@@ -1593,6 +1594,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                     sP,
                     sLSE,
                     sdST,
+                    sdOT,
                     sSum_OdO,
                     dK,
                     dV,
@@ -2402,6 +2404,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         sLSE: cute.Tensor,
         # sdS: cute.Tensor,
         sdST: cute.Tensor,
+        sdOT: cute.Tensor,
         sSum_OdO: cute.Tensor,
         dK: cute.Tensor,
         dV: cute.Tensor,
@@ -2684,6 +2687,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             dV_tma,
             sdK_epi_layout,
             sdV_epi_layout,
+            sdOT,
             sP,
         )
 
@@ -2802,6 +2806,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         dV_tma: cute.Tensor,
         sdK_epi_layout: cute.ComposedLayout,
         sdV_epi_layout: cute.ComposedLayout,
+        sdOT: cute.Tensor,
         sP: cute.Tensor,
     ):
         """Epilogue phase to store result from tensor memory to register, then global memory."""
@@ -2833,17 +2838,16 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         dp_idx = tidx % 128
         wg_idx = (tidx % (self.num_compute_warps * self.threads_per_warp)) // 128
 
-        # Variant 3a (2/5): SMEM staging views over sP+sdST (32 KB combined,
-        # both regions dead at this point — see EPILOGUE_REFACTOR_DESIGN.md
-        # SMEM audit). One view per output tensor; per-WG slice via the
-        # stage axis. Currently UNUSED — store path is still per-thread
-        # self.store(...) below; TMA wiring lands in subsequent commits.
+        # Variant 3a (2/5): SMEM staging views over existing scratch storage.
+        # dV stages through sdOT because final dK MMA can still be consuming
+        # sdST when dV epilogue begins; dK stages through sP+sdST after that
+        # MMA completes. TMA wiring lands in subsequent commits.
         s_epi_dK = cute.make_tensor(
             cute.recast_ptr(sP.iterator, sdK_epi_layout.inner, dK.element_type),
             sdK_epi_layout.outer,
         )
         s_epi_dV = cute.make_tensor(
-            cute.recast_ptr(sP.iterator, sdV_epi_layout.inner, dV.element_type),
+            cute.recast_ptr(sdOT.iterator, sdV_epi_layout.inner, dV.element_type),
             sdV_epi_layout.outer,
         )
         sdK_per_wg = s_epi_dK[None, None, wg_idx]
@@ -2856,7 +2860,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         # mapping. With cta_tiler[1]=64 < 128 we distribute threads across
         # both M and N: thr (64, 2) × val (1, 128//bf16.width) → atom tile
         # (64, 16) for bf16 → 8 atoms per WG slot of (64, 128).
-        # Currently UNUSED — store path is still per-thread self.store(...).
         num_bits_per_copy = 128
         bf16_vals_per_copy = num_bits_per_copy // dV.element_type.width
         r2s_m_thr = self.cta_tiler[1]
@@ -2917,6 +2920,12 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
 
         if blk_coord_k * self.tile_shape_K < problem_shape_k_cur_batch:
             cute.copy(tiled_t2r_dV, tTR_tdV, tTR_rdV)
+            tTR_rdV_cast = cute.make_rmem_tensor(tTR_rdV.shape, dV.element_type)
+            tTR_rdV_cast.store(tTR_rdV.load().to(dV.element_type))
+            tTR_rdV_r2s = cute.make_tensor(tTR_rdV_cast.iterator, tdV_sdV_r2s.shape)
+            cute.copy(thr_copy_r2s_dV, tTR_rdV_r2s, tdV_sdV_r2s)
+            cute.arch.fence_view_async_shared()
+            cute.arch.barrier(barrier_id=5 + wg_idx, number_of_threads=128)
             self.store(tTR_gdV, tTR_rdV, tTR_cdV, (K, D))
 
         cute.arch.fence_view_async_tmem_load()
@@ -2930,6 +2939,12 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             for i in cutlass.range(cute.size(tTR_rdK), unroll_full=True):
                 tTR_rdK[i] = scale_softmax * tTR_rdK[i]
 
+            tTR_rdK_cast = cute.make_rmem_tensor(tTR_rdK.shape, dK.element_type)
+            tTR_rdK_cast.store(tTR_rdK.load().to(dK.element_type))
+            tTR_rdK_r2s = cute.make_tensor(tTR_rdK_cast.iterator, tdK_sdK_r2s.shape)
+            cute.copy(thr_copy_r2s_dK, tTR_rdK_r2s, tdK_sdK_r2s)
+            cute.arch.fence_view_async_shared()
+            cute.arch.barrier(barrier_id=5 + wg_idx, number_of_threads=128)
             self.store(tTR_gdK, tTR_rdK, tTR_cdK, (K, D))
 
         cute.arch.fence_view_async_tmem_load()
