@@ -34,9 +34,19 @@ Both kernel branches are pushed to `fork = github.com/Johnsonms/flash-attention`
 
 ## Restoring in the new container
 
-After cloning the fork in the new container:
+```bash
+git clone https://github.com/Johnsonms/flash-attention.git
+cd flash-attention
+git checkout hd256-bwd-epilogue-refactor   # kernel code (clean; agent_space is gitignored here)
 
-1. **Restore memory**:
+# Pull agent_space from the recovery branch into the working tree, but
+# unstage it so it sits as untracked files (matching the original
+# gitignored-but-present dev setup):
+git checkout hd256-bwd-epilogue-refactor-recovery -- agent_space/
+git restore --staged agent_space/
+```
+
+1. **Restore Claude memory**:
    ```bash
    mkdir -p ~/.claude/projects/-workspace/memory/
    cp agent_space/ncu_hd256/_recovery/memory/*.md ~/.claude/projects/-workspace/memory/
