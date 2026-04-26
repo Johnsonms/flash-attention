@@ -2684,6 +2684,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             dV_tma,
             sdK_epi_layout,
             sdV_epi_layout,
+            sP,
         )
 
         if not cutlass.const_expr(self.use_clc_scheduler):
@@ -2801,6 +2802,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         dV_tma: cute.Tensor,
         sdK_epi_layout: cute.ComposedLayout,
         sdV_epi_layout: cute.ComposedLayout,
+        sP: cute.Tensor,
     ):
         """Epilogue phase to store result from tensor memory to register, then global memory."""
         tidx, _, _ = cute.arch.thread_idx()
@@ -2830,6 +2832,22 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         num_warp_groups = self.num_compute_warps // 4
         dp_idx = tidx % 128
         wg_idx = (tidx % (self.num_compute_warps * self.threads_per_warp)) // 128
+
+        # Variant 3a (2/5): SMEM staging views over sP+sdST (32 KB combined,
+        # both regions dead at this point — see EPILOGUE_REFACTOR_DESIGN.md
+        # SMEM audit). One view per output tensor; per-WG slice via the
+        # stage axis. Currently UNUSED — store path is still per-thread
+        # self.store(...) below; TMA wiring lands in subsequent commits.
+        s_epi_dK = cute.make_tensor(
+            cute.recast_ptr(sP.iterator, sdK_epi_layout.inner, dK.element_type),
+            sdK_epi_layout.outer,
+        )
+        s_epi_dV = cute.make_tensor(
+            cute.recast_ptr(sP.iterator, sdV_epi_layout.inner, dV.element_type),
+            sdV_epi_layout.outer,
+        )
+        sdK_per_wg = s_epi_dK[None, None, wg_idx]
+        sdV_per_wg = s_epi_dV[None, None, wg_idx]
 
         tiled_t2r_dK = tcgen05.make_tmem_copy(load_op, tdKtdK)
         thread_t2r_dK = tiled_t2r_dK.get_slice(dp_idx)
