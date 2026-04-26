@@ -2849,6 +2849,33 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         sdK_per_wg = s_epi_dK[None, None, wg_idx]
         sdV_per_wg = s_epi_dV[None, None, wg_idx]
 
+        # Variant 3a (3/5): r2s tiled_copy for the per-WG SMEM slot. The atom
+        # is independent of the TMEM-load layout — by using a separate r2s
+        # thread layout we let the SMEM swizzle (carried by sdK/V_epi_layout)
+        # govern element placement, rather than the TMEM-load atom's lane
+        # mapping. With cta_tiler[1]=64 < 128 we distribute threads across
+        # both M and N: thr (64, 2) × val (1, 128//bf16.width) → atom tile
+        # (64, 16) for bf16 → 8 atoms per WG slot of (64, 128).
+        # Currently UNUSED — store path is still per-thread self.store(...).
+        num_bits_per_copy = 128
+        bf16_vals_per_copy = num_bits_per_copy // dV.element_type.width
+        r2s_m_thr = self.cta_tiler[1]
+        r2s_n_thr = 128 // r2s_m_thr
+        r2s_thr_layout = cute.make_ordered_layout((r2s_m_thr, r2s_n_thr), order=(1, 0))
+        r2s_val_layout = cute.make_ordered_layout((1, bf16_vals_per_copy), order=(1, 0))
+        r2s_copy_atom_dV = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), dV.element_type, num_bits_per_copy=num_bits_per_copy,
+        )
+        r2s_copy_atom_dK = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), dK.element_type, num_bits_per_copy=num_bits_per_copy,
+        )
+        tiled_copy_r2s_dV = cute.make_tiled_copy_tv(r2s_copy_atom_dV, r2s_thr_layout, r2s_val_layout)
+        tiled_copy_r2s_dK = cute.make_tiled_copy_tv(r2s_copy_atom_dK, r2s_thr_layout, r2s_val_layout)
+        thr_copy_r2s_dV = tiled_copy_r2s_dV.get_slice(dp_idx)
+        thr_copy_r2s_dK = tiled_copy_r2s_dK.get_slice(dp_idx)
+        tdV_sdV_r2s = thr_copy_r2s_dV.partition_D(sdV_per_wg)
+        tdK_sdK_r2s = thr_copy_r2s_dK.partition_D(sdK_per_wg)
+
         tiled_t2r_dK = tcgen05.make_tmem_copy(load_op, tdKtdK)
         thread_t2r_dK = tiled_t2r_dK.get_slice(dp_idx)
 
