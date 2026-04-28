@@ -730,6 +730,12 @@ class BlackwellFusedMultiHeadAttentionForward:
             swizzle=q_smem_layout_staged.inner,
             byte_alignment=128,
         )
+        # Alias the O TMA epilogue staging buffer onto sQ. sQ is dead by the
+        # time correction_epilog runs (all Q tiles loaded before correction starts).
+        sO_epi = cute.make_tensor(
+            cute.recast_ptr(sQ.iterator, sO_epi_layout.inner, self.o_dtype),
+            sO_epi_layout.outer,
+        )
         sK = smem.allocate_tensor(
             element_type=self.k_dtype,
             layout=k_smem_layout_staged.outer,
