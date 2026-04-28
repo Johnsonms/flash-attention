@@ -8,6 +8,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
+from cutlass.cute.nvgpu import cpasync
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
@@ -457,6 +458,25 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.tma_copy_q_bytes = q_copy_size * cute.size(qk_tiled_mma.thr_id.shape)
         self.tma_copy_kv_bytes = k_copy_size * cute.size(qk_tiled_mma.thr_id.shape)
 
+        # TMA store for O epilogue
+        tma_store_op = cpasync.CopyBulkTensorTileS2GOp()
+        epi_cols_O = math.gcd(128 // (self.o_dtype.width // 8), self.epi_tile[1])
+        epi_tile_O = (self.epi_tile[0], epi_cols_O)
+        self.sO_epi_layout = sm100_utils.make_smem_layout_epi(
+            self.o_dtype,
+            self.o_layout,
+            epi_tile_O,
+            1,
+        )
+        self.epi_cols_O = epi_cols_O
+        self.num_epi_stages_O = self.epi_tile[1] // epi_cols_O
+        tma_atom_O, mO_tma = cpasync.make_tiled_tma_atom(
+            tma_store_op,
+            o,
+            cute.select(self.sO_epi_layout, mode=[0, 1]),
+            epi_tile_O,
+        )
+
         @cute.struct
         class SharedStorage:
             # TMA G2S load barriers: LOAD warp (producer) -> MMA warp (consumer)
@@ -498,6 +518,8 @@ class BlackwellFusedMultiHeadAttentionForward:
             tma_tensor_k,
             tma_atom_v,
             tma_tensor_v,
+            tma_atom_O,
+            mO_tma,
             o,
             cum_seqlen_q,
             cum_seqlen_k,
@@ -512,6 +534,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             k_smem_layout_staged,
             p_tmem_layout,
             v_smem_layout_staged,
+            self.sO_epi_layout,
             self.tile_sched_params,
         ).launch(
             grid=grid,
@@ -533,6 +556,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         mK_kdl: cute.Tensor,
         tma_atom_v: cute.CopyAtom,
         mV_dkl: cute.Tensor,
+        tma_atom_O: cute.CopyAtom,
+        mO_tma: cute.Tensor,
         mO_qdl: cute.Tensor,
         cum_seqlen_q: Optional[cute.Tensor],
         cum_seqlen_k: Optional[cute.Tensor],
@@ -547,6 +572,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         k_smem_layout_staged: cute.ComposedLayout,
         p_tmem_layout_staged: cute.ComposedLayout,
         v_smem_layout_staged: cute.ComposedLayout,
+        sO_epi_layout: cute.ComposedLayout,
         tile_sched_params: FmhaStaticTileSchedulerParams | FmhaClcDynamicTileSchedulerParams,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -558,6 +584,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_q)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_k)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_v)
+            cpasync.prefetch_descriptor(tma_atom_O)
 
         bidx, _, _ = cute.arch.block_idx()
         mma_tile_coord_v = bidx % cute.size(qk_tiled_mma.thr_id.shape)
