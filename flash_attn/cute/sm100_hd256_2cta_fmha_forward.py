@@ -1383,6 +1383,15 @@ class BlackwellFusedMultiHeadAttentionForward:
                     )
                     gO_staged = gO_qdl[None, None, curr_block_coord[0], None, curr_block_coord[2]]
                     cO_staged = cO_qdl[None, None, curr_block_coord[0], None, curr_block_coord[2]]
+                    varlen = cum_seqlen_q is not None
+                    gO_tma_staged = gO_staged
+                    if cutlass.const_expr(not varlen):
+                        gO_tma_qdl = cute.flat_divide(
+                            mO_tma, cute.select(self.pv_block_tiler, mode=[0, 1])
+                        )
+                        gO_tma_staged = gO_tma_qdl[
+                            None, None, curr_block_coord[0], None, curr_block_coord[2]
+                        ]
                     cS = cute.make_identity_tensor((self.qk_mma_tiler[0], self.qk_mma_tiler[1]))
                     tScS = qk_thr_mma.partition_C(cS)
 
@@ -1403,6 +1412,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                         (sum_consumer, sSum),
                         (mma_corr_consumer, gO_staged, cO_staged, tOtO_staged),
                         self.epi_tile,
+                        (tma_atom_O, gO_tma_staged, sO_epi, varlen),
                     )
                 work_tile = tile_sched.advance_to_next_work()
             # NOTE: tmem.free() moved to kernel end to enable cluster-wide sync
@@ -1714,10 +1724,12 @@ class BlackwellFusedMultiHeadAttentionForward:
         sum_args: Tuple,
         o_args: Tuple,
         epi_tile: cute.Tile,
+        tma_args: Tuple,
     ) -> Tuple[pipeline.PipelineConsumer, pipeline.PipelineProducer]:
         (seqlen_q, scale_output) = value_args
         (sum_consumer, sSum) = sum_args
         (mma_o_consumer, gO_staged, cO_staged, tOtO_staged) = o_args
+        tma_atom_O, gO_tma_staged, sO_epi, varlen = tma_args
         tidx, _, _ = cute.arch.thread_idx()
         thread_idx = tidx % (self.threads_per_warp * len(self.softmax_warp_ids))
         sum_handle = sum_consumer.wait_and_advance()
@@ -1726,13 +1738,18 @@ class BlackwellFusedMultiHeadAttentionForward:
         sum_handle.release()
         scale = scale_output / row_sum
         o_handle = mma_o_consumer.wait_and_advance()
+
+        epi_cols_O = self.epi_cols_O
+        num_epi_stages_O = self.num_epi_stages_O
+        epi_tile_O = (epi_tile[0], epi_cols_O)
+        leader_warp = (cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4) == 0
+
         for iter in cutlass.range(self.iterations_pv):
             gO = gO_staged[None, None, iter]
             cO = cO_staged[None, None, iter]
             tOtO = tOtO_staged[(None, None), 0, 0, iter]
             tOtO_epi = cute.zipped_divide(tOtO, epi_tile)
             cO_epi = cute.zipped_divide(cO, epi_tile)
-            gO_epi = cute.zipped_divide(gO, epi_tile)
             tidx, _, _ = cute.arch.thread_idx()
             thread_idx = tidx % (self.threads_per_warp * len(self.softmax_warp_ids))
             tmem_copy_atom = cute.make_copy_atom(
@@ -1741,24 +1758,78 @@ class BlackwellFusedMultiHeadAttentionForward:
             tiled_tmem_load = tcgen05.make_tmem_copy(tmem_copy_atom, tOtO_epi)
             thr_tmem_load = tiled_tmem_load.get_slice(thread_idx)
             tTMEM_LOADtO = thr_tmem_load.partition_S(tOtO_epi)
-            tTMEM_LOADgO = thr_tmem_load.partition_D(gO_epi)
             tTMEM_LOADcO = thr_tmem_load.partition_D(cO_epi)
-            for i in cutlass.range(cute.size(tTMEM_LOADtO, mode=[1]), unroll_full=True):
-                tTMEM_LOADtO_i = tTMEM_LOADtO[None, i, 0]
-                tTMEM_LOADgO_i = tTMEM_LOADgO[None, i, 0]
-                tTMEM_LOADcO_i = tTMEM_LOADcO[None, i, 0]
-                tTMrO = cute.make_rmem_tensor(tTMEM_LOADcO[None, 0, i].shape, self.pv_acc_dtype)
-                cute.copy(tiled_tmem_load, tTMEM_LOADtO_i, tTMrO)
-                for j in cutlass.range(0, cute.size(tTMrO), 2, unroll_full=True):
-                    tTMrO[j], tTMrO[j + 1] = cute.arch.mul_packed_f32x2(
-                        (tTMrO[j], tTMrO[j + 1]),
-                        (scale, scale),
-                    )
-                tSMrO = cute.make_rmem_tensor(tTMrO.shape, self.o_dtype)
-                o_vec = tTMrO.load()
-                tSMrO.store(o_vec.to(self.o_dtype))
-                if cute.elem_less(tTMEM_LOADcO_i[0][0], seqlen_q):
-                    cute.autovec_copy(tSMrO, tTMEM_LOADgO_i)
+
+            if cutlass.const_expr(not varlen):
+                # Non-varlen: stage into SMEM then TMA bulk-store to GMEM.
+                cO_local = cute.make_identity_tensor(epi_tile)
+                cO_local_epi = cute.zipped_divide(cO_local, epi_tile)
+                tTMEM_LOADcO_local = thr_tmem_load.partition_D(cO_local_epi)
+
+                gO_tma = gO_tma_staged[None, None, iter]
+                gO_tma_epi = cute.local_tile(gO_tma, epi_tile_O, (0, None))
+                sO_stage = sO_epi[None, None, 0]
+
+                for stage_k in cutlass.range_constexpr(num_epi_stages_O):
+                    for i in cutlass.range(cute.size(tTMEM_LOADtO, mode=[1]), unroll_full=True):
+                        tTMEM_LOADtO_i = tTMEM_LOADtO[None, i, 0]
+                        tTMEM_LOADcO_i = tTMEM_LOADcO[None, i, 0]
+                        tTMEM_LOADcO_local_i = tTMEM_LOADcO_local[None, i, 0]
+                        tTMrO = cute.make_rmem_tensor(tTMEM_LOADcO_local_i.shape, self.pv_acc_dtype)
+                        cute.copy(tiled_tmem_load, tTMEM_LOADtO_i, tTMrO)
+                        for j in cutlass.range(0, cute.size(tTMrO), 2, unroll_full=True):
+                            tTMrO[j], tTMrO[j + 1] = cute.arch.mul_packed_f32x2(
+                                (tTMrO[j], tTMrO[j + 1]),
+                                (scale, scale),
+                            )
+                        tSMrO = cute.make_rmem_tensor(tTMrO.shape, self.o_dtype)
+                        tSMrO.store(tTMrO.load().to(self.o_dtype))
+                        for j in cutlass.range_constexpr(cute.size(tTMEM_LOADcO_local_i)):
+                            c = tTMEM_LOADcO_local_i[j]
+                            m_pos = c[0]
+                            n_pos = c[1]
+                            if n_pos // epi_cols_O == stage_k:
+                                if cute.elem_less(tTMEM_LOADcO_i[j][0], seqlen_q):
+                                    sO_epi[m_pos, n_pos % epi_cols_O, 0] = tSMrO[j]
+
+                    cute.arch.fence_view_async_shared()
+                    cute.arch.barrier(barrier_id=3, number_of_threads=128)
+
+                    if leader_warp:
+                        gO_stage = gO_tma_epi[None, None, stage_k]
+                        td_sO, td_gO = cpasync.tma_partition(
+                            tma_atom_O,
+                            0,
+                            cute.make_layout(1),
+                            cute.group_modes(sO_stage, 0, 2),
+                            cute.group_modes(gO_stage, 0, 2),
+                        )
+                        cute.copy(tma_atom_O, td_sO, td_gO)
+                        cute.arch.cp_async_bulk_commit_group()
+                        cute.arch.cp_async_bulk_wait_group(0, read=True)
+
+                    cute.arch.barrier(barrier_id=3, number_of_threads=128)
+            else:
+                # Varlen fallback: per-thread scattered GMEM store.
+                gO_epi = cute.zipped_divide(gO, epi_tile)
+                tTMEM_LOADgO = thr_tmem_load.partition_D(gO_epi)
+                for i in cutlass.range(cute.size(tTMEM_LOADtO, mode=[1]), unroll_full=True):
+                    tTMEM_LOADtO_i = tTMEM_LOADtO[None, i, 0]
+                    tTMEM_LOADgO_i = tTMEM_LOADgO[None, i, 0]
+                    tTMEM_LOADcO_i = tTMEM_LOADcO[None, i, 0]
+                    tTMrO = cute.make_rmem_tensor(tTMEM_LOADcO[None, 0, i].shape, self.pv_acc_dtype)
+                    cute.copy(tiled_tmem_load, tTMEM_LOADtO_i, tTMrO)
+                    for j in cutlass.range(0, cute.size(tTMrO), 2, unroll_full=True):
+                        tTMrO[j], tTMrO[j + 1] = cute.arch.mul_packed_f32x2(
+                            (tTMrO[j], tTMrO[j + 1]),
+                            (scale, scale),
+                        )
+                    tSMrO = cute.make_rmem_tensor(tTMrO.shape, self.o_dtype)
+                    o_vec = tTMrO.load()
+                    tSMrO.store(o_vec.to(self.o_dtype))
+                    if cute.elem_less(tTMEM_LOADcO_i[0][0], seqlen_q):
+                        cute.autovec_copy(tSMrO, tTMEM_LOADgO_i)
+
         o_handle.release()
         return mma_o_consumer, sum_consumer
 
