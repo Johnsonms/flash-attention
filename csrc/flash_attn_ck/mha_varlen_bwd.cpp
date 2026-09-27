@@ -277,6 +277,7 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
     TORCH_CHECK(head_size % 8 == 0, "head_size should be a multiple of 8");
     TORCH_CHECK(head_size <= 256, "CK FlashAttention backward only supports head dimension at most 256");
+    flash::check_alibi_seqlen_supported(alibi_slopes_.has_value(), max_seqlen_q, max_seqlen_k);
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
     if (window_size_left >= max_seqlen_k) { window_size_left = -1; }

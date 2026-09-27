@@ -213,6 +213,7 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     if (window_size_right >= seqlen_k) { window_size_right = -1; }
 
     // causal=true is the same as causal=false in this case
+    flash::check_alibi_seqlen_supported(alibi_slopes_.has_value(), seqlen_q, seqlen_k);
     if (seqlen_q == 1 && !alibi_slopes_.has_value()) { is_causal = false; }
 
     mask_info mask;

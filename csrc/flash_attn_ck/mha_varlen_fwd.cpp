@@ -486,6 +486,8 @@ mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_si
     else
     {
         num_splits = 1;
+        // fmha_fwd; the paged path above runs fmha_fwd_splitkv, whose ALiBi is 32-bit
+        flash::check_alibi_seqlen_supported(alibi_slopes_.has_value(), max_seqlen_q, max_seqlen_k);
     }
 
     int64_t counter_offset = batch_size * num_heads * ck_tile::get_warp_size();

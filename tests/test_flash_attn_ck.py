@@ -1689,3 +1689,37 @@ def test_flash_attn_varlen_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, caus
         assert torch.equal(dv, dv0)
         assert torch.equal(dk, dk0)
         assert torch.equal(dq, dq0)
+
+
+@pytest.mark.parametrize("varlen", [False, True])
+def test_flash_attn_alibi_seqlen_limit(varlen):
+    # CK computes ALiBi positions with 16-bit arithmetic: seqlen_k = 65536 must be right, and anything
+    # longer must fail instead of returning wrong results.
+    device = "cuda"
+    torch.random.manual_seed(0)
+    nheads, d, dtype = 2, 64, torch.float16
+    alibi_slopes = torch.rand(1, nheads, device=device, dtype=torch.float32) * 0.3
+
+    def run(seqlen_k):
+        q = torch.randn(1, 1, nheads, d, device=device, dtype=dtype, requires_grad=True)
+        k = torch.randn(1, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True)
+        v = torch.randn(1, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True)
+        if varlen:
+            cu_seqlens_q = torch.tensor([0, 1], device=device, dtype=torch.int32)
+            cu_seqlens_k = torch.tensor([0, seqlen_k], device=device, dtype=torch.int32)
+            out = flash_attn_varlen_func(
+                q[0], k[0], v[0], cu_seqlens_q, cu_seqlens_k, 1, seqlen_k, causal=True, alibi_slopes=alibi_slopes
+            )[None]
+        else:
+            out = flash_attn_func(q, k, v, causal=True, alibi_slopes=alibi_slopes)
+        out.backward(torch.randn_like(out))
+        return q, k, v, out
+
+    q, k, v, out = run(65536)
+    attn_bias = attn_bias_from_alibi_slopes(alibi_slopes, 1, 65536, causal=True)
+    out_ref, _ = attention_ref(q, k, v, attn_bias=attn_bias, causal=True)
+    out_pt, _ = attention_ref(q, k, v, attn_bias=attn_bias, causal=True, upcast=False, reorder_ops=True)
+    assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item() + 1e-3
+
+    with pytest.raises(RuntimeError, match="ALiBi"):
+        run(65537)

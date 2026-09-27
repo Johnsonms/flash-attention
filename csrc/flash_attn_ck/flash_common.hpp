@@ -85,4 +85,14 @@ int override_num_splits_if_necessary(int batch,
                                      float p_drop,
                                      int num_splits);
 
+// ck_tile::Alibi defaults to 16-bit position arithmetic (LogMaxSadOprndSize = 16), which fmha_fwd and
+// fmha_bwd use, so ALiBi gives wrong results once a query or key position exceeds 65535.
+// fmha_fwd_splitkv uses 32 bits and is not affected.
+inline void check_alibi_seqlen_supported(bool has_alibi, int64_t max_seqlen_q, int64_t max_seqlen_k)
+{
+    TORCH_CHECK(!has_alibi || (max_seqlen_q <= 65536 && max_seqlen_k <= 65536),
+                "The CK backend does not support ALiBi with seqlen_q or seqlen_k above 65536 yet: ",
+                "its ALiBi positions are 16-bit (got seqlen_q=", max_seqlen_q, ", seqlen_k=", max_seqlen_k, ")");
+}
+
 } // namespace flash
