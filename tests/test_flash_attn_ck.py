@@ -25,7 +25,22 @@ from test_flash_attn import (
     attention_qkvpacked_ref,
 )
 
-from flash_attn.layers.rotary import apply_rotary_emb
+from flash_attn.layers.rotary import apply_rotary_emb_torch
+
+
+def apply_rotary_emb_ref(x, cos, sin, seqlen_offsets, interleaved=False):
+    """Pure-PyTorch rotary reference with per-batch position offsets, computed in fp32.
+
+    The Triton apply_rotary_emb occasionally returns wrong values on gfx950 when several processes share
+    the GPU (e.g. pytest -n), which made the kvcache tests below flaky; the reference must not depend on it.
+    x: (batch_size, seqlen, nheads, headdim); cos, sin: (seqlen_ro, rotary_dim / 2); seqlen_offsets: (batch_size,)
+    """
+    seqlen = x.shape[1]
+    out = [
+        apply_rotary_emb_torch(x[i : i + 1].float(), cos[o : o + seqlen].float(), sin[o : o + seqlen].float(), interleaved)
+        for i, o in enumerate(seqlen_offsets.tolist())
+    ]
+    return torch.cat(out).to(x.dtype)
 
 
 def is_bwd_hdim_supported(d):
@@ -1174,24 +1189,24 @@ def test_flash_attn_kvcache(
         cos = torch.cos(angle).to(dtype=dtype)
         sin = torch.sin(angle).to(dtype=dtype)
         if causal or local:
-            q_ro = apply_rotary_emb(
-                q, cos, sin, seqlen_offsets=cache_seqlens, interleaved=rotary_interleaved
+            q_ro = apply_rotary_emb_ref(
+                q, cos, sin, cache_seqlens, interleaved=rotary_interleaved
             )
         else:
             q_ro = rearrange(
-                apply_rotary_emb(
+                apply_rotary_emb_ref(
                     rearrange(q, "b s h d -> b 1 (s h) d"),
                     cos,
                     sin,
-                    seqlen_offsets=cache_seqlens,
+                    cache_seqlens,
                     interleaved=rotary_interleaved,
                 ),
                 "b 1 (s h) d -> b s h d",
                 s=seqlen_q,
             )
         # q_ro = q
-        k_ro = apply_rotary_emb(
-            k, cos, sin, seqlen_offsets=cache_seqlens, interleaved=rotary_interleaved
+        k_ro = apply_rotary_emb_ref(
+            k, cos, sin, cache_seqlens, interleaved=rotary_interleaved
         )
     else:
         cos, sin = None, None
