@@ -2363,6 +2363,11 @@ def _flash_attn_bwd(
         AtomLayoutMdQ = 1
         AtomLayoutNdKV = 1
         requested_disable_2cta = utils._get_disable_2cta_default()
+        # hdim 256 on the general kernel runs a 64-row KV tile per CTA (NOTE [M=64 accumulator
+        # layout] in flash_bwd_sm100.py); the 2CTA / block-sparse decisions below see that tile.
+        hd256_generic = head_dim == 256 and head_dim_v == 256 and utils._get_hd256_generic_bwd()
+        if hd256_generic:
+            n_block_size = 64
         kv_subtile_factor = get_kv_subtile_factor(block_sparse_tensors, n_block_size)
         use_2cta_instrs = (
             head_dim >= 128
@@ -2383,6 +2388,23 @@ def _flash_attn_bwd(
         # The 64-row tile writes the GQA dK/dV accumulate tile row-major (NOTE [M=64
         # accumulator layout]); the postprocess has to read it the same way.
         bwd_dkv_accum_row_major = use_2cta_instrs and n_block_size == 64
+        bwd_force_serial = (
+            utils._get_bwd_schedule_override() == "serial" and use_2cta_instrs and head_dim <= 128
+        )
+        if hd256_generic:
+            # 2CTA, 64-row KV tile, serial schedule, row-major GQA accumulate.
+            if not use_2cta_instrs:
+                reason = (
+                    "2CTA was disabled by request"
+                    if requested_disable_2cta
+                    else (
+                        f"sparse_block_size[1] must cover an even number of tile_n={n_block_size} "
+                        f"tiles; got factor {kv_subtile_factor}"
+                    )
+                )
+                raise ValueError(f"SM100 backward with head_dim=256 requires 2CTA; {reason}.")
+            bwd_force_serial = True
+            bwd_dkv_accum_row_major = True
         if block_sparse_tensors is not None and head_dim == 192 and not use_2cta_instrs:
             reason = (
                 "2CTA was disabled by request"
@@ -2397,7 +2419,12 @@ def _flash_attn_bwd(
             )
         cluster_size = 2 if use_2cta_instrs else 1
 
-    use_dedicated_hd256_kernel = arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
+    use_dedicated_hd256_kernel = (
+        arch // 10 in [10, 11]
+        and head_dim == 256
+        and head_dim_v == 256
+        and not utils._get_hd256_generic_bwd()
+    )
     if (
         use_dedicated_hd256_kernel
         or (arch // 10 in [10, 11] and cu_seqlens_q is not None)
@@ -2794,6 +2821,7 @@ def _flash_attn_bwd(
             head_dim,
             head_dim_v,
             qhead_per_kvhead,
+            bwd_force_serial,
             causal,
             window_size_left is not None,
             window_size_right is not None,
@@ -2959,6 +2987,7 @@ def _flash_attn_bwd(
                     has_aux_tensors=aux_tensors is not None,
                     q_subtile_factor=q_subtile_factor,
                     kv_subtile_factor=kv_subtile_factor,
+                    force_serial_schedule=bwd_force_serial,
                 )
 
         # Block sparse tensors for backward use Q-direction indexing (transposed from forward).
