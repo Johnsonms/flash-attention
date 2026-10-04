@@ -102,12 +102,6 @@ def _get_disable_2cta_default(is_fwd: bool = False) -> bool:
         return _fa_disable_2cta_enabled
 
 
-def _get_hd256_generic_bwd() -> bool:
-    """FA_HD256_GENERIC_BWD=1 runs the SM100 hdim 256 backward on FlashAttentionBackwardSm100
-    (64-row KV tile, serial 2CTA schedule) instead of the dedicated kernels."""
-    return os.getenv("FA_HD256_GENERIC_BWD", "0") == "1"
-
-
 def _get_bwd_schedule_override() -> Optional[str]:
     """Test knob: FLASH_ATTENTION_BWD_SCHEDULE=serial forces the SM100 2CTA backward onto the
     serial schedule (hdim 192's SMEM aliasing) for head dims that default to the pipelined one."""

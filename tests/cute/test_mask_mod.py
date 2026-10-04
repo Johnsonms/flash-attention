@@ -180,6 +180,10 @@ def assert_bwd_matches_reference(
 
     bwd_rtol = 2
     bwd_atol_floor = 1e-5 if min_seqlen >= 64 else 3e-5
+    if dk_cute.shape[-1] >= 256:
+        # dPsum is computed from the bf16-rounded O, so the residual dS of the seqlen_k=1
+        # (P == 1, dK ~ 0) cases grows with the head dim; the floor follows it.
+        bwd_atol_floor *= 2
     dq_atol = max(bwd_atol_floor, 2 * (dq_ref_fp32 + 0.3 - 0.3 - dq_ref_fp32).abs().max().item())
     dk_atol = max(bwd_atol_floor, 2 * (dk_ref_fp32 + 0.3 - 0.3 - dk_ref_fp32).abs().max().item())
     dv_atol = max(bwd_atol_floor, 2 * (dv_ref_fp32 + 0.3 - 0.3 - dv_ref_fp32).abs().max().item())
@@ -782,8 +786,6 @@ def test_static_masks(
     """
     if COMPUTE_CAPABILITY == 10 and (tile_m, tile_n) != (128, 128):
         pytest.skip("TODO: Non-128x128 tiles currently not supported on SM 10.0. due to TMEM")
-    if headdim == 256:
-        pytest.skip("head_dim=256 backward does not support mask_mod yet")
 
     _run_mask_test(
         seqlen_q=seqlen_q,
@@ -836,8 +838,6 @@ def test_parameterized_masks(
     """
     if COMPUTE_CAPABILITY == 10 and (tile_m, tile_n) != (128, 128):
         pytest.skip("TODO: Non-128x128 tiles currently not supported on SM 10.0. due to TMEM")
-    if headdim == 256:
-        pytest.skip("head_dim=256 backward does not support mask_mod yet")
 
     _run_mask_test(
         seqlen_q=seqlen_q,

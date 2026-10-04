@@ -66,7 +66,6 @@ from flash_attn.cute.flash_bwd_mla_dq_dqv_sm100_h64 import dQdQvGemmKernelH64
 from flash_attn.cute.flash_bwd_mla_dk_sm100 import dKGemmKernel
 
 # SM100 head_dim=256 2CTA backward kernel
-from flash_attn.cute.sm100_hd256_2cta_fmha_backward import BlackwellFusedMultiHeadAttentionBackward
 
 from flash_attn.cute.utils import AuxData
 from flash_attn.cute.block_sparsity import (
@@ -2363,9 +2362,9 @@ def _flash_attn_bwd(
         AtomLayoutMdQ = 1
         AtomLayoutNdKV = 1
         requested_disable_2cta = utils._get_disable_2cta_default()
-        # hdim 256 on the general kernel runs a 64-row KV tile per CTA (NOTE [M=64 accumulator
-        # layout] in flash_bwd_sm100.py); the 2CTA / block-sparse decisions below see that tile.
-        hd256_generic = head_dim == 256 and head_dim_v == 256 and utils._get_hd256_generic_bwd()
+        # hdim 256 runs a 64-row KV tile per CTA (NOTE [M=64 accumulator layout] in
+        # flash_bwd_sm100.py); the 2CTA / block-sparse decisions below see that tile.
+        hd256_generic = head_dim == 256 and head_dim_v == 256
         if hd256_generic:
             n_block_size = 64
         kv_subtile_factor = get_kv_subtile_factor(block_sparse_tensors, n_block_size)
@@ -2419,27 +2418,10 @@ def _flash_attn_bwd(
             )
         cluster_size = 2 if use_2cta_instrs else 1
 
-    use_dedicated_hd256_kernel = (
-        arch // 10 in [10, 11]
-        and head_dim == 256
-        and head_dim_v == 256
-        and not utils._get_hd256_generic_bwd()
-    )
-    if (
-        use_dedicated_hd256_kernel
-        or (arch // 10 in [10, 11] and cu_seqlens_q is not None)
-    ) and torch.is_tensor(max_seqlen_q):
+    if arch // 10 in [10, 11] and cu_seqlens_q is not None and torch.is_tensor(max_seqlen_q):
         max_seqlen_q = None
-    if (
-        use_dedicated_hd256_kernel
-        or (arch // 10 in [10, 11] and cu_seqlens_k is not None)
-    ) and torch.is_tensor(max_seqlen_k):
+    if arch // 10 in [10, 11] and cu_seqlens_k is not None and torch.is_tensor(max_seqlen_k):
         max_seqlen_k = None
-    if use_dedicated_hd256_kernel:
-        assert learnable_sink is None, (
-            "SM100 backward with head_dim=256 does not support learnable_sink"
-        )
-    use_2cta_instrs = use_2cta_instrs or use_dedicated_hd256_kernel
     is_varlen = (
         cu_seqlens_q is not None
         or cu_seqlens_k is not None
@@ -2595,16 +2577,12 @@ def _flash_attn_bwd(
     head_dim_rounded = (head_dim + hdim_multiple_of - 1) // hdim_multiple_of * hdim_multiple_of
 
     if cu_seqlens_q is None:
-        dq_accum = (
-            None
-            if use_dedicated_hd256_kernel
-            else torch.empty(
-                batch_size,
-                num_head,
-                seqlen_q_rounded * head_dim_rounded,
-                dtype=torch.float32,
-                device=device,
-            )
+        dq_accum = torch.empty(
+            batch_size,
+            num_head,
+            seqlen_q_rounded * head_dim_rounded,
+            dtype=torch.float32,
+            device=device,
         )
         dpsum = torch.empty(
             batch_size, num_head, seqlen_q_rounded, dtype=torch.float32, device=device
@@ -2616,12 +2594,8 @@ def _flash_attn_bwd(
         total_q_rounded_padded = (
             (total_q + cu_seqlens_q.shape[0] * m_block_size - 1) // m_block_size * m_block_size
         )
-        dq_accum = (
-            None
-            if use_dedicated_hd256_kernel
-            else torch.empty(
-                num_head, total_q_rounded_padded * head_dim_rounded, dtype=torch.float32, device=device
-            )
+        dq_accum = torch.empty(
+            num_head, total_q_rounded_padded * head_dim_rounded, dtype=torch.float32, device=device
         )
         dpsum = torch.empty(num_head, total_q_rounded_padded, dtype=torch.float32, device=device)
         lse_log2 = torch.empty(num_head, total_q_rounded_padded, dtype=torch.float32, device=device)
@@ -2629,8 +2603,7 @@ def _flash_attn_bwd(
     # GQA (qhead_per_kvhead > 1) needs dK/dV accum+postprocess since multiple Q heads
     # accumulate into the same dK/dV. SM90 varlen_k with qhead_per_kvhead==1 now uses
     # ragged TMA tensors for direct store, so no longer needs accum+postprocess.
-    # hd=256 2CTA backward has its own internal postprocess for dK/dV.
-    dKV_postprocess = qhead_per_kvhead > 1 and not use_dedicated_hd256_kernel
+    dKV_postprocess = qhead_per_kvhead > 1
     if dKV_postprocess:
         # Same rounding as the kernel's tile_hdimv and the postprocess (64 with dKV_swapAB on
         # SM90): the GQA epilogue reduces tile_n * tile_hdimv fp32 values per block.
@@ -2688,7 +2661,7 @@ def _flash_attn_bwd(
     # shared across preprocess, main bwd, and the three postprocess calls.
     cu_total_m_blocks_q = None
     cu_total_m_blocks_k = None
-    if is_varlen and batch_size > BIN_BATCH_SEARCH_THRESH and not use_dedicated_hd256_kernel:
+    if is_varlen and batch_size > BIN_BATCH_SEARCH_THRESH:
         cu_total_m_blocks_q, _ = _compute_tile_cumsum(
             cu_seqlens=cu_seqlens_q,
             seqused=seqused_q,
@@ -2855,8 +2828,6 @@ def _flash_attn_bwd(
             single_q_block,
             single_k_block,
             cu_total_m_blocks_k is not None,
-            use_dedicated_hd256_kernel and cu_seqlens_q is not None and max_seqlen_q is None,
-            use_dedicated_hd256_kernel and cu_seqlens_k is not None and max_seqlen_k is None,
         )
 
     if compile_key not in _flash_attn_bwd.compile_cache:
@@ -2939,62 +2910,31 @@ def _flash_attn_bwd(
                 dQ_single_wg=dQ_single_wg,
             )
         else:
-            if use_dedicated_hd256_kernel:
-                assert softcap == 0.0, "SM100 backward with head_dim=256 does not support softcap"
-                assert block_sparse_tensors is None, \
-                    "SM100 backward with head_dim=256 does not support block sparsity"
-                assert dlse is None, \
-                    "SM100 backward with head_dim=256 does not support dlse"
-
-                dq_tile_mn = (128, 128)
-                dkdv_tile_mn = (128, 64)
-                fa_bwd_obj = BlackwellFusedMultiHeadAttentionBackward(
-                    head_dim,
-                    head_dim_v,
-                    is_causal=causal,
-                    is_local=local,
-                    qhead_per_kvhead=qhead_per_kvhead,
-                    is_persistent=False,
-                    deterministic=deterministic,
-                    cluster_size=cluster_size,
-                    use_2cta_instrs=use_2cta_instrs,
-                    score_mod=score_mod,
-                    score_mod_bwd=score_mod_bwd,
-                    mask_mod=mask_mod,
-                    has_aux_tensors=aux_tensors is not None,
-                    q_subtile_factor=q_subtile_factor,
-                    tile_m_dq=dq_tile_mn[0],
-                    tile_n_dq=dq_tile_mn[1],
-                    tile_m_dkdv=dkdv_tile_mn[0],
-                    tile_n_dkdv=dkdv_tile_mn[1],
-                )
-            else:
-                fa_bwd_obj = FlashAttentionBackwardSm100(
-                    head_dim,
-                    head_dim_v,
-                    is_causal=causal,
-                    is_local=local,
-                    qhead_per_kvhead=qhead_per_kvhead,
-                    tile_m=m_block_size,
-                    tile_n=n_block_size,
-                    cluster_size=cluster_size,
-                    use_2cta_instrs=use_2cta_instrs,
-                    deterministic=deterministic,
-                    spt=spt,
-                    score_mod=score_mod,
-                    score_mod_bwd=score_mod_bwd,
-                    mask_mod=mask_mod,
-                    has_aux_tensors=aux_tensors is not None,
-                    q_subtile_factor=q_subtile_factor,
-                    kv_subtile_factor=kv_subtile_factor,
-                    force_serial_schedule=bwd_force_serial,
-                )
+            fa_bwd_obj = FlashAttentionBackwardSm100(
+                head_dim,
+                head_dim_v,
+                is_causal=causal,
+                is_local=local,
+                qhead_per_kvhead=qhead_per_kvhead,
+                tile_m=m_block_size,
+                tile_n=n_block_size,
+                cluster_size=cluster_size,
+                use_2cta_instrs=use_2cta_instrs,
+                deterministic=deterministic,
+                spt=spt,
+                score_mod=score_mod,
+                score_mod_bwd=score_mod_bwd,
+                mask_mod=mask_mod,
+                has_aux_tensors=aux_tensors is not None,
+                q_subtile_factor=q_subtile_factor,
+                kv_subtile_factor=kv_subtile_factor,
+                force_serial_schedule=bwd_force_serial,
+            )
 
         # Block sparse tensors for backward use Q-direction indexing (transposed from forward).
         sparse_tensors_compile = None
         if normalized_block_sparse_tensors is not None:
             sparse_tensors_compile = to_cute_block_sparse_tensors(normalized_block_sparse_tensors)
-        dq_accum_tensor = dq_tensor if use_dedicated_hd256_kernel else dq_accum_tensor
 
         compile_args = [
             fa_bwd_obj,
@@ -3020,19 +2960,7 @@ def _flash_attn_bwd(
             AuxData(cute_aux_tensors, aux_scalars),
             sparse_tensors_compile,
         ]
-        if not use_dedicated_hd256_kernel:
-            compile_args.append(cu_total_m_blocks_k_tensor)
-        else:
-            compile_args.extend(
-                (
-                    Int32(max_seqlen_q)
-                    if cu_seqlens_q is not None and max_seqlen_q is not None
-                    else None,
-                    Int32(max_seqlen_k)
-                    if cu_seqlens_k is not None and max_seqlen_k is not None
-                    else None,
-                )
-            )
+        compile_args.append(cu_total_m_blocks_k_tensor)
         compile_args.append(current_stream)
 
         # TODO: check @can_implement
@@ -3040,7 +2968,6 @@ def _flash_attn_bwd(
             *compile_args, options="--enable-tvm-ffi"
         )
     if not fake_mode:
-        dq_accum = dq if use_dedicated_hd256_kernel else dq_accum
         call_args = [
             q.detach(),
             k.detach(),
@@ -3075,72 +3002,58 @@ def _flash_attn_bwd(
             if normalized_block_sparse_tensors is not None
             else None,
         ]
-        if not use_dedicated_hd256_kernel:
-            call_args.append(cu_total_m_blocks_k)
-        else:
-            call_args.extend(
-                (
-                    max_seqlen_q
-                    if cu_seqlens_q is not None
-                    else None,
-                    max_seqlen_k
-                    if cu_seqlens_k is not None
-                    else None,
-                )
-            )
+        call_args.append(cu_total_m_blocks_k)
         _flash_attn_bwd.compile_cache[compile_key](*call_args)
     # Postprocess: convert dq_accum from float32 to dq in bf16/fp16
-    # hd=256 2CTA backward has its own internal postprocess, skip here.
-    if not use_dedicated_hd256_kernel:
-        if arch // 10 == 9:
-            # dQ postprocess: match main kernel's MMA WG count, unless dQ_single_wg
-            num_threads_post_dQ = 128 if dQ_single_wg else cfg.num_wg * 128
-            num_threads_post_dKV = cfg.num_wg * 128
-        else:
-            num_threads_post_dQ = 128
-            num_threads_post_dKV = 128
+    if arch // 10 == 9:
+        # dQ postprocess: match main kernel's MMA WG count, unless dQ_single_wg
+        num_threads_post_dQ = 128 if dQ_single_wg else cfg.num_wg * 128
+        num_threads_post_dKV = cfg.num_wg * 128
+    else:
+        num_threads_post_dQ = 128
+        num_threads_post_dKV = 128
 
+    _bwd_postprocess_convert(
+        dq_accum, dq, softmax_scale,
+        cu_seqlens_q, seqused_q,
+        arch, dtype, head_dim, m_block_size, num_threads_post_dQ,
+        AtomLayoutMdQ, dQ_swapAB,
+        use_2cta_instrs=use_2cta_instrs, cluster_size=1,
+        cu_total_m_blocks=cu_total_m_blocks_q,
+        sink_tensors=(
+            LearnableSinkBwdTensors(dpsum, lse, learnable_sink, dsink)
+            if learnable_sink is not None
+            else None
+        ),
+        fake_mode=fake_mode,
+        hdim_multiple_of=hdim_multiple_of,
+    )
+
+    if dKV_postprocess:
+        # Postprocess: convert dk_accum from float32 to dk in bf16/fp16
         _bwd_postprocess_convert(
-            dq_accum, dq, softmax_scale,
-            cu_seqlens_q, seqused_q,
-            arch, dtype, head_dim, m_block_size, num_threads_post_dQ,
-            AtomLayoutMdQ, dQ_swapAB,
-            use_2cta_instrs=use_2cta_instrs, cluster_size=1,
-            cu_total_m_blocks=cu_total_m_blocks_q,
-            sink_tensors=(
-                LearnableSinkBwdTensors(dpsum, lse, learnable_sink, dsink)
-                if learnable_sink is not None
-                else None
-            ),
+            dk_accum, dk, softmax_scale,
+            cu_seqlens_k, seqused_k,
+            arch, dtype, head_dim, n_block_size, num_threads_post_dKV,
+            AtomLayoutNdKV, dKV_swapAB,
+            cluster_size=cluster_size,
+            cu_total_m_blocks=cu_total_m_blocks_k if cluster_size == 1 else None,
             fake_mode=fake_mode,
             hdim_multiple_of=hdim_multiple_of,
+            accum_row_major=bwd_dkv_accum_row_major,
         )
-
-        if dKV_postprocess:
-            # Postprocess: convert dk_accum from float32 to dk in bf16/fp16
-            _bwd_postprocess_convert(
-                dk_accum, dk, softmax_scale,
-                cu_seqlens_k, seqused_k,
-                arch, dtype, head_dim, n_block_size, num_threads_post_dKV,
-                AtomLayoutNdKV, dKV_swapAB,
-                cluster_size=cluster_size,
-                cu_total_m_blocks=cu_total_m_blocks_k if cluster_size == 1 else None,
-                fake_mode=fake_mode,
-                hdim_multiple_of=hdim_multiple_of,
-                accum_row_major=bwd_dkv_accum_row_major,
-            )
-            # Postprocess: convert dv_accum from float32 to dv in bf16/fp16
-            _bwd_postprocess_convert(
-                dv_accum, dv, 1.0,
-                cu_seqlens_k, seqused_k,
-                arch, dtype, head_dim_v, n_block_size, num_threads_post_dKV,
-                AtomLayoutNdKV, dKV_swapAB,
-                cluster_size=cluster_size,
-                cu_total_m_blocks=cu_total_m_blocks_k if cluster_size == 1 else None,
-                fake_mode=fake_mode,
-                hdim_multiple_of=hdim_multiple_of,
-                accum_row_major=bwd_dkv_accum_row_major,
-            )
+        # Postprocess: convert dv_accum from float32 to dv in bf16/fp16
+        _bwd_postprocess_convert(
+            dv_accum, dv, 1.0,
+            cu_seqlens_k, seqused_k,
+            arch, dtype, head_dim_v, n_block_size, num_threads_post_dKV,
+            AtomLayoutNdKV, dKV_swapAB,
+            cluster_size=cluster_size,
+            cu_total_m_blocks=cu_total_m_blocks_k if cluster_size == 1 else None,
+            fake_mode=fake_mode,
+            hdim_multiple_of=hdim_multiple_of,
+            accum_row_major=bwd_dkv_accum_row_major,
+        )
 
     return (dq, dk, dv) if learnable_sink is None else (dq, dk, dv, dsink)
 

@@ -1105,8 +1105,6 @@ def test_sm90_block_sparse_score_mod_backward_with_dq_swapab():
 @pytest.mark.parametrize("use_autograd", [True, False])
 def test_cute_vs_flex_attention_backward(seqlen_q, seqlen_kv, dim, dtype, score_mod_triple, use_autograd):
     """Test backward pass with score_mod against flex_attention reference."""
-    if dim == 256:
-        pytest.skip("head_dim=256 backward does not support score_mod yet")
     if COMPUTE_CAPABILITY == 9 and dim == 64:
         pytest.skip("head_dim=64 not supported on SM90 for backward")
 
@@ -1177,8 +1175,6 @@ def make_aux_tensors_for_bwd(cute_score_mod, eager_factory, seqlen_q, num_heads,
 def test_cute_vs_flex_attention_backward_with_aux(
     seqlen_q, seqlen_kv, dim, dtype, score_mod_triple
 ):
-    if dim == 256:
-        pytest.skip("head_dim=256 backward does not support score_mod yet")
     if COMPUTE_CAPABILITY == 9 and dim == 64:
         pytest.skip("head_dim=64 not supported on SM90 for backward")
 
@@ -1240,8 +1236,6 @@ def test_cute_vs_flex_attention_backward_with_aux(
 def test_cute_vs_flex_attention_backward_pack_gqa(
     seqlen_q, seqlen_kv, dim, dtype, qhead_per_kvhead, num_kv_heads, score_mod_triple
 ):
-    if dim == 256:
-        pytest.skip("head_dim=256 backward does not support score_mod yet")
     if COMPUTE_CAPABILITY == 9:
         pytest.xfail("pack_gqa backward not yet implemented on SM90")
 
