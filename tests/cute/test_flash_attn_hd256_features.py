@@ -10,8 +10,8 @@ from flash_attn.cute.interface import flash_attn_func
 from flash_attn.cute.testing import attention_ref
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 11),
-    reason="SM100/SM110-only hd256 forward features",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (9, 10, 11),
+    reason="SM90/SM100/SM110 hd256 forward features",
 )
 
 HEAD_DIM = 256

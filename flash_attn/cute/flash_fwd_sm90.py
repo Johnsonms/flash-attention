@@ -56,9 +56,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         intra_wg_overlap: bool = True,
         mma_pv_is_rs: bool = True,
         paged_kv_non_tma: bool = False,
+        kv_subtile_factor: int = 1,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
+        # Block-sparse KV blocks span kv_subtile_factor tile_n-wide tiles
+        self.kv_subtile_factor = kv_subtile_factor
         self.intra_wg_overlap = intra_wg_overlap
         self.mma_pv_is_rs = mma_pv_is_rs
         self.buffer_align_bytes = 1024
@@ -905,6 +908,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                             self.intra_wg_overlap,
                             self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
                             self.q_subtile_factor,
+                            self.kv_subtile_factor,
                         )
 
                 tile_scheduler.prefetch_next_work()
@@ -1222,6 +1226,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     self.warp_scheduler_barrier_arrive,
                     self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
                     self.q_subtile_factor,
+                    self.kv_subtile_factor,
                 )
 
                 # Release Q pipeline so the producer can load the next tile's Q

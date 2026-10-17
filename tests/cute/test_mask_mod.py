@@ -1416,7 +1416,7 @@ def test_sm100_block_sparse_coarse_blocks():
     )
 
 
-@pytest.mark.skipif(COMPUTE_CAPABILITY != 10, reason="SM100-only test")
+@pytest.mark.skipif(COMPUTE_CAPABILITY not in (9, 10), reason="SM90/SM100 coarse KV forward")
 @pytest.mark.parametrize("headdim", [128, 192])
 def test_sm100_block_sparse_coarse_kv_masks_tail_subtiles(headdim):
     """Exercise ragged coarse-KV blocks whose expanded physical subtiles include K padding."""
