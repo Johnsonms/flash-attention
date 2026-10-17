@@ -416,6 +416,9 @@ def _get_fwd_config(
     if arch // 10 == 12:
         assert num_splits <= 1, "SM120 forward only supports num_splits=1"
         num_splits = 1
+    elif arch // 10 == 9 and num_splits < 1:
+        # No SplitKV on SM90 yet: the split heuristic (num_splits < 1) resolves to one split.
+        num_splits = 1
     elif num_splits < 1:
         num_SMs = get_num_sms_for_selection(device.index, arch)
         num_splits = num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, 128)
