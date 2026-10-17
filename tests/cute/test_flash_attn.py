@@ -724,8 +724,6 @@ def test_flash_attn_output(
         ):
             if d > 192 and IS_SM90:
                 pytest.xfail("hdim > 192 backward: SM90 not supported yet")
-            if d != dv and mha_type != "mha" and IS_SM90:
-                pytest.xfail("SM90 GQA bwd currently requires headdim == headdim_v")
             g = torch.randn_like(out)
             # do_o = ((g.float() * out.float()).sum(-1)).transpose(1, 2)
             grad_tensors = (q, k, v, learnable_sink) if has_learnable_sink else (q, k, v)
@@ -1678,8 +1676,6 @@ def test_flash_attn_varlen_output(
         ):
             if d > 192 and IS_SM90:
                 pytest.xfail("hdim > 192 backward: SM90 not supported yet")
-            if d != dv and mha_type != "mha" and IS_SM90:
-                pytest.xfail("SM90 GQA bwd currently requires headdim == headdim_v")
             g_unpad = torch.randn_like(out_unpad)
             # do_o = ((g_unpad.float() * out_unpad.float()).sum(-1)).transpose(-1, -2)
             # import flash_attn_3_cuda

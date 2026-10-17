@@ -113,7 +113,6 @@ class FlashAttentionBackwardSm90:
         self.V_in_regs = V_in_regs
         # May be overridden in __call__ for varlen inputs.
         if qhead_per_kvhead > 1:
-            assert self.same_hdim_kv, "GQA backward requires head_dim == head_dim_v"
             assert self.num_wg_mma == 2, "GQA backward assumes 2 warp groups"
         # These are tuned for speed
         # Do we keep the LSE and dPsum in each thread, or split them across 8 threads that share
@@ -230,6 +229,21 @@ class FlashAttentionBackwardSm90:
         self.sV_layout = sm90_utils.make_smem_layout(
             self.dtype, LayoutEnum.ROW_MAJOR, (self.tile_n, self.tile_hdimv), None
         )
+        # The GQA epilogue stages the fp32 dK / dV accumulators in sV + sK (contiguous in
+        # SharedStorage). That holds tile_n * (hdim + hdimv) bf16, so with head_dim != head_dim_v
+        # the larger accumulator does not fit for all MMA warpgroups at once; it is then staged
+        # and reduced one warpgroup at a time.
+        staging_bytes = (
+            (cute.cosize(self.sV_layout) + cute.cosize(self.sK_layout)) * self.dtype.width // 8
+        )
+        self.dKaccum_wg_serial, self.dVaccum_wg_serial = [
+            self.tile_n * hdim * Float32.width // 8 > staging_bytes
+            for hdim in (self.tile_hdim, self.tile_hdimv)
+        ]
+        for hdim in (self.tile_hdim, self.tile_hdimv):
+            assert self.tile_n * hdim * Float32.width // 8 // self.num_wg_mma <= staging_bytes, (
+                "GQA dK/dV staging does not fit in sV + sK"
+            )
         # Accomodate both S and S.T
         wg_n_SdP = self.num_wg_mma // self.AtomLayoutMSdP
         wg_n_dKV = self.AtomLayoutNdKV
@@ -1648,6 +1662,46 @@ class FlashAttentionBackwardSm90:
         return consumer_state_Q, consumer_state_dO
 
     @cute.jit
+    def stage_and_reduce_accum(
+        self,
+        acc: cute.Tensor,
+        tsAccum: cute.Tensor,
+        sAccum: cute.Tensor,
+        gAccum: cute.Tensor,
+        num_bytes: cutlass.Constexpr[int],
+        wg_serial: cutlass.Constexpr[bool],
+        epi_barrier: cutlass.pipeline.NamedBarrier,
+        warp_idx: Int32,
+        tidx: Int32,
+        read_flag: cutlass.Constexpr[bool],
+    ):
+        """Stage a GQA fp32 dK/dV accumulator in smem and bulk-reduce-add it into gmem.
+
+        With wg_serial, sAccum holds one warpgroup's chunk (warpgroup stride 0) and the MMA
+        warpgroups take turns; otherwise they all stage at once.
+        """
+        for r in cutlass.range_constexpr(self.num_wg_mma if const_expr(wg_serial) else 1):
+            if const_expr(r > 0):
+                # The previous turn's bulk reduce must be done reading the staging buffer.
+                cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
+            epi_barrier.arrive_and_wait()
+            if const_expr(not wg_serial) or tidx // self.num_threads_per_warp_group == r:
+                trAccum_flat = cute.make_tensor(acc.iterator, tsAccum.shape)
+                cute.autovec_copy(trAccum_flat, tsAccum)
+            cute.arch.fence_view_async_shared()
+            epi_barrier.arrive_and_wait()
+            if warp_idx == 4:
+                with cute.arch.elect_one():
+                    for wg_idx in cutlass.range_constexpr(self.num_wg_mma):
+                        if const_expr(not wg_serial or wg_idx == r):
+                            copy_utils.cpasync_reduce_bulk_add_f32(
+                                sAccum[None, wg_idx].iterator,
+                                gAccum[None, wg_idx].iterator,
+                                num_bytes // self.num_wg_mma,
+                            )
+                cute.arch.cp_async_bulk_commit_group()
+
+    @cute.jit
     def epilogue_dKV(
         self,
         acc_dV: cute.Tensor,
@@ -1725,8 +1779,15 @@ class FlashAttentionBackwardSm90:
             deterministic_KV = self.deterministic and self.qhead_per_kvhead > 1
             sdKaccum_shape0 = self.tile_n * self.tile_hdim // self.num_wg_mma
             sdVaccum_shape0 = self.tile_n * self.tile_hdimv // self.num_wg_mma
-            sdKaccum_layout = cute.make_layout((sdKaccum_shape0, self.num_wg_mma))
-            sdVaccum_layout = cute.make_layout((sdVaccum_shape0, self.num_wg_mma))
+            # Warpgroup stride 0 when staged one warpgroup at a time (see _setup_attributes).
+            sdKaccum_layout = cute.make_layout(
+                (sdKaccum_shape0, self.num_wg_mma),
+                stride=(1, 0 if const_expr(self.dKaccum_wg_serial) else sdKaccum_shape0),
+            )
+            sdVaccum_layout = cute.make_layout(
+                (sdVaccum_shape0, self.num_wg_mma),
+                stride=(1, 0 if const_expr(self.dVaccum_wg_serial) else sdVaccum_shape0),
+            )
             head_idx_kv = head_idx // qhead_per_kvhead_divmod
             if const_expr(deterministic_KV):
                 assert mdK_semaphore is not None
@@ -1761,39 +1822,35 @@ class FlashAttentionBackwardSm90:
             cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
             if const_expr(deterministic_KV):
                 barrier.wait_eq(mdK_semaphore_cur.iterator, tidx, 0, lock_value)
-            epi_barrier.arrive_and_wait()
-            tdKrdKaccum_flat = cute.make_tensor(acc_dK.iterator, tdKsdKaccum.shape)
-            cute.autovec_copy(tdKrdKaccum_flat, tdKsdKaccum)
-            cute.arch.fence_view_async_shared()
-            epi_barrier.arrive_and_wait()
-            if warp_idx == 4:
-                with cute.arch.elect_one():
-                    for wg_idx in cutlass.range_constexpr(self.num_wg_mma):
-                        copy_utils.cpasync_reduce_bulk_add_f32(
-                            sdKaccum[None, wg_idx].iterator,
-                            gdKaccum[None, wg_idx].iterator,
-                            self.tma_copy_bytes["dKacc"] // self.num_wg_mma,
-                        )
-                cute.arch.cp_async_bulk_commit_group()
+            self.stage_and_reduce_accum(
+                acc_dK,
+                tdKsdKaccum,
+                sdKaccum,
+                gdKaccum,
+                self.tma_copy_bytes["dKacc"],
+                self.dKaccum_wg_serial,
+                epi_barrier,
+                warp_idx,
+                tidx,
+                read_flag,
+            )
 
             cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
             if const_expr(deterministic_KV):
                 barrier.arrive_inc(mdK_semaphore_cur.iterator, tidx, 0, 1)
                 barrier.wait_eq(mdV_semaphore_cur.iterator, tidx, 0, lock_value)
-            epi_barrier.arrive_and_wait()
-            tdVrdVaccum_flat = cute.make_tensor(acc_dV.iterator, tdVsdVaccum.shape)
-            cute.autovec_copy(tdVrdVaccum_flat, tdVsdVaccum)
-            cute.arch.fence_view_async_shared()
-            epi_barrier.arrive_and_wait()
-            if warp_idx == 4:
-                with cute.arch.elect_one():
-                    for wg_idx in cutlass.range_constexpr(self.num_wg_mma):
-                        copy_utils.cpasync_reduce_bulk_add_f32(
-                            sdVaccum[None, wg_idx].iterator,
-                            gdVaccum[None, wg_idx].iterator,
-                            self.tma_copy_bytes["dVacc"] // self.num_wg_mma,
-                        )
-                cute.arch.cp_async_bulk_commit_group()
+            self.stage_and_reduce_accum(
+                acc_dV,
+                tdVsdVaccum,
+                sdVaccum,
+                gdVaccum,
+                self.tma_copy_bytes["dVacc"],
+                self.dVaccum_wg_serial,
+                epi_barrier,
+                warp_idx,
+                tidx,
+                read_flag,
+            )
             if const_expr(deterministic_KV):
                 cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
                 barrier.arrive_inc(mdV_semaphore_cur.iterator, tidx, 0, 1)
