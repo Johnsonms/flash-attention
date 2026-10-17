@@ -717,13 +717,15 @@ def test_flash_attn_output(
             and (
                 (dv == d and d <= 128)
                 or (d == 192 and dv == 128)
-                or (IS_SM100 and d == 256 and dv == 256 and (softcap == 0.0 or HD256_GENERIC_BWD))
+                or (
+                    d == 256
+                    and dv == 256
+                    and (IS_SM90 or (IS_SM100 and (softcap == 0.0 or HD256_GENERIC_BWD)))
+                )
             )
             # and False
             and not ((causal or local) and seqlen_k < seqlen_q)
         ):
-            if d > 192 and IS_SM90:
-                pytest.xfail("hdim > 192 backward: SM90 not supported yet")
             if d != dv and mha_type != "mha" and IS_SM90:
                 pytest.xfail("SM90 GQA bwd currently requires headdim == headdim_v")
             g = torch.randn_like(out)
@@ -1671,13 +1673,15 @@ def test_flash_attn_varlen_output(
             and (
                 (dv == d and d <= 128)
                 or (d == 192 and dv == 128)
-                or (IS_SM100 and d == 256 and dv == 256 and (softcap == 0.0 or HD256_GENERIC_BWD))
+                or (
+                    d == 256
+                    and dv == 256
+                    and (IS_SM90 or (IS_SM100 and (softcap == 0.0 or HD256_GENERIC_BWD)))
+                )
             )
             and not has_learnable_sink
             # and False
         ):
-            if d > 192 and IS_SM90:
-                pytest.xfail("hdim > 192 backward: SM90 not supported yet")
             if d != dv and mha_type != "mha" and IS_SM90:
                 pytest.xfail("SM90 GQA bwd currently requires headdim == headdim_v")
             g_unpad = torch.randn_like(out_unpad)
