@@ -80,11 +80,6 @@ def test_flash_attn_output(
     local = local_enum > 0
     if local and causal:
         pytest.skip()
-    is_sm90 = torch.cuda.get_device_capability()[0] == 9
-    if is_sm90 and d == 192:
-        pytest.xfail("headdim 192 not supported on sm90")
-    if d == 256 and IS_SM90:
-        pytest.xfail("hdim > 192 backward: SM90 not supported yet")
     # The SM100 head_dim=256 backward does not support these features yet (the forward does).
     # Remove these skips when support is added.
     if d == 256 and IS_SM100 and not HD256_GENERIC_BWD:
@@ -265,13 +260,13 @@ def test_flash_attn_output(
             and (
                 (dv == d and d <= 128)
                 or (d == 192 and dv == 128)
-                or (IS_SM100 and d == 256 and dv == 256)
+                or ((IS_SM90 or IS_SM100) and d == 256 and dv == 256)
             )
             and learnable_sink is None
             # and False
         ):
-            if IS_SM90 and local:
-                pytest.xfail("SM90 backward: local attention not supported yet")
+            if d != dv and mha_type != "mha" and IS_SM90:
+                pytest.xfail("SM90 GQA bwd currently requires headdim == headdim_v")
             g = torch.randn_like(out)
             # do_o = ((g.float() * out.float()).sum(-1)).transpose(1, 2)
             dq, dk, dv = torch.autograd.grad(out, (q, k, v), g)
@@ -428,13 +423,6 @@ def test_flash_attn_varlen_output(
     local = local_enum > 0
     if local and causal:
         pytest.skip()
-    is_sm90 = torch.cuda.get_device_capability()[0] == 9
-    if is_sm90 and local:
-        pytest.xfail("bwd local attention not supported on sm90")
-    if is_sm90 and d == 192:
-        pytest.xfail("headdim 192 not supported on sm90")
-    if d == 256 and IS_SM90:
-        pytest.xfail("hdim > 192 backward: SM90 not supported yet")
     # The SM100 head_dim=256 backward does not support these features yet (the forward does).
     # Remove these skips when support is added.
     if d == 256 and IS_SM100 and not HD256_GENERIC_BWD:
@@ -683,12 +671,13 @@ def test_flash_attn_varlen_output(
             and (
                 (dv == d and d <= 128)
                 or (d == 192 and dv == 128)
-                or (IS_SM100 and d == 256 and dv == 256)
+                or ((IS_SM90 or IS_SM100) and d == 256 and dv == 256)
             )
             and not has_learnable_sink
-            and not is_sm90
             # and False
         ):
+            if d != dv and mha_type != "mha" and IS_SM90:
+                pytest.xfail("SM90 GQA bwd currently requires headdim == headdim_v")
             g_unpad = torch.randn_like(out_unpad)
             # do_o = ((g_unpad.float() * out_unpad.float()).sum(-1)).transpose(-1, -2)
             # import flash_attn_3_cuda

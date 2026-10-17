@@ -86,8 +86,6 @@ def test_flash_attn_output(seqlen_q, seqlen_k, d, causal, num_splits, mha_type, 
         and d <= 128
         and not (causal and seqlen_k < seqlen_q)
     )
-    if IS_SM90 and d == 64 and not causal:
-        can_bwd = False  # SM90 d=64 non-causal xfail
     if not can_bwd:
         return
 
@@ -314,8 +312,8 @@ def test_flash_attn_varlen_unpad_output(seqlen, d, causal, mha_type, unpad_q, un
     fwd_atol = 2 * (out_ref_masked + 0.3 - 0.3 - out_ref_masked).abs().max().item()
     assert (out_masked - out_ref_masked).abs().max().item() <= 2 * (out_pt_masked - out_ref_masked).abs().max().item() + fwd_atol
 
-    # Backward (original test skips all SM90 varlen backward)
-    can_bwd = d <= 128 and not IS_SM90
+    # Backward
+    can_bwd = d <= 128
     if not can_bwd:
         return
 

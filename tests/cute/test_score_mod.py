@@ -1105,8 +1105,6 @@ def test_sm90_block_sparse_score_mod_backward_with_dq_swapab():
 @pytest.mark.parametrize("use_autograd", [True, False])
 def test_cute_vs_flex_attention_backward(seqlen_q, seqlen_kv, dim, dtype, score_mod_triple, use_autograd):
     """Test backward pass with score_mod against flex_attention reference."""
-    if COMPUTE_CAPABILITY == 9 and dim == 64:
-        pytest.skip("head_dim=64 not supported on SM90 for backward")
 
     torch.random.manual_seed(42)
     cute_fwd, cute_bwd, eager_ref = score_mod_triple
@@ -1175,8 +1173,6 @@ def make_aux_tensors_for_bwd(cute_score_mod, eager_factory, seqlen_q, num_heads,
 def test_cute_vs_flex_attention_backward_with_aux(
     seqlen_q, seqlen_kv, dim, dtype, score_mod_triple
 ):
-    if COMPUTE_CAPABILITY == 9 and dim == 64:
-        pytest.skip("head_dim=64 not supported on SM90 for backward")
 
     torch.random.manual_seed(42)
     cute_fwd, cute_bwd, eager_factory = score_mod_triple

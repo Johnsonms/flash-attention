@@ -1361,8 +1361,6 @@ def test_varlen_score_mod_backward(
     seqlens_q, seqlens_k, dim, dtype, score_mod_tuple, use_autograd
 ):
     """Varlen backward with score_mod (no global indices in bwd)."""
-    if IS_SM90 and dim == 64:
-        pytest.skip("head_dim=64 not supported on SM90 for backward")
 
     torch.random.manual_seed(42)
     cute_fwd, cute_bwd, eager_factory, aux_type = score_mod_tuple
@@ -1449,8 +1447,6 @@ def test_varlen_score_mod_backward_with_global(
     Backward: 2 * scale[global_kv] * score * grad — needs all of grad, score, and
     a global-indexed aux read.
     """
-    if IS_SM90 and dim == 64:
-        pytest.skip("head_dim=64 not supported on SM90 for backward")
 
     torch.random.manual_seed(42)
     cute_fwd, cute_bwd, eager_factory, aux_type, requires_global = score_mod_tuple

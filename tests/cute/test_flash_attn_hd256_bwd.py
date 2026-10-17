@@ -1,4 +1,4 @@
-"""hd256 forward + backward on SM100/SM110 against FP64 eager, dense and varlen.
+"""hd256 forward + backward on SM90/SM100/SM110 against FP64 eager, dense and varlen.
 
 Shapes sit on the 128-row tile edges (127/128/129), a partial last tile (1000), a long
 sequence (4096) and Q/K length mismatches in both directions, for MHA and 24/4 GQA, causal
@@ -15,8 +15,8 @@ from eager_reference import check_against_reference, make_cu_seqlens
 from flash_attn.cute.interface import flash_attn_func, flash_attn_varlen_func
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 11),
-    reason="SM100/SM110-only hd256 backward",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (9, 10, 11),
+    reason="SM90/SM100/SM110 hd256 backward",
 )
 
 HEAD_DIM = 256
