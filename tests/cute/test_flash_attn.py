@@ -325,6 +325,20 @@ def test_flash_attn_sm90_hdim_padding_value_dim(d, d_v, varlen):
     check_sm90_hdim_padding(d, varlen=varlen, d_v=d_v)
 
 
+@pytest.mark.skipif(not IS_SM90, reason="SM90 backward value-dim regression")
+@pytest.mark.parametrize("d,d_v", [(128, 96), (128, 64), (96, 64)])
+# seqlen_q = 80 is one dense hdim-128 m block per head, so every head's preprocess
+# tile borders the next head's dPsum rows.
+@pytest.mark.parametrize("seqlen_q,seqlen_k", [(80, 211), (257, 513)])
+@pytest.mark.parametrize("mask", ["dense", "causal"])
+@pytest.mark.parametrize("varlen", [False, True])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_sm90_value_dim_smaller(d, d_v, seqlen_q, seqlen_k, mask, varlen):
+    """head_dim_v < head_dim: dO's smem layout follows head_dim_v, and the dense hdim-128
+    tile_m = 80 must not let the preprocess write dPsum into the next head's rows."""
+    check_sm90_hdim_padding(d, seqlen_q, seqlen_k, mask, varlen, d_v=d_v)
+
+
 @pytest.mark.skipif(not IS_SM90, reason="SM90 backward padding regression")
 @pytest.mark.parametrize(
     "d_first,d_second",
