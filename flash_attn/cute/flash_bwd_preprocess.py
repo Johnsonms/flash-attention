@@ -122,6 +122,10 @@ class FlashAttentionBackwardPreprocess:
         self.gmem_tiled_copy_O = copy_utils.tiled_copy_2d(
             self.dtype, threads_per_row, self.num_threads, num_copy_elems
         )
+        # When tile_m is not a multiple of the rows one copy pass covers (e.g. tile_m = 80 with
+        # 64 rows per pass at head_dim_v 96), the partition spans rows past tile_m, which belong
+        # to the next m block (or the next head/batch slice of PdPsum).
+        self.copy_covers_tile_m = self.tile_m % (self.num_threads // threads_per_row) == 0
         universal_copy_bits = 128
         num_copy_elems_dQaccum = universal_copy_bits // Float32.width
         assert (
@@ -462,7 +466,9 @@ class FlashAttentionBackwardPreprocess:
                             PdPsum_val -= gdLSE[row]
                     # Without padded per-sequence offsets there is no slack past seqlen: the
                     # zero-filled tail would alias the next sequence (or fall off the buffer).
-                    if const_expr(self.use_padded_offsets) or row < seqlen_limit:
+                    if (const_expr(self.use_padded_offsets) or row < seqlen_limit) and (
+                        const_expr(self.copy_covers_tile_m) or row < self.tile_m
+                    ):
                         gPdPsum[row] = PdPsum_val
 
             # Clear dQaccum

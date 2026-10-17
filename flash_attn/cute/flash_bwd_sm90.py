@@ -214,7 +214,7 @@ class FlashAttentionBackwardSm90:
             )
             for shape, stage, mms in [
                 ((self.tile_m, self.tile_hdim), self.Q_stage, self.tile_hdim // wg_d_dKV),
-                ((self.tile_m, self.tile_hdimv), self.dO_stage, self.tile_hdim // wg_d_dKV),
+                ((self.tile_m, self.tile_hdimv), self.dO_stage, self.tile_hdimv // wg_d_dKV),
             ]
         ]
         wg_d_dQ = self.num_wg_dQ // self.AtomLayoutMdQ
