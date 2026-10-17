@@ -1487,7 +1487,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
     def mma_init(self):
         warp_group_idx = utils.canonical_warp_group_idx(sync=False)
         if const_expr(self.use_scheduler_barrier):
-            if warp_group_idx == 1:
+            # Prime the ring from the last MMA warpgroup, the one that signals WG1 in
+            # warp_scheduler_barrier_arrive. If WG1 arrived on its own barrier, its first
+            # warp_scheduler_barrier_sync would be a second barrier instruction on the same
+            # barrier before it resets, which PTX says to avoid.
+            if warp_group_idx == self.num_wg_mma:
                 cute.arch.barrier_arrive(
                     barrier_id=int(NamedBarrierFwd.WarpSchedulerWG1),
                     number_of_threads=2 * self.num_threads_per_warp_group,
