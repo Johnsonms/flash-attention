@@ -300,10 +300,6 @@ def produce_block_sparse_loads(
         qhead_per_kvhead: Pack-GQA factor. When > 1, m_block is in packed space and
             must be converted to unpacked for sparse tensor indexing.
     """
-    # The SM90 consumer (consume_block_sparse_loads) has no kv_subtile support yet.
-    assert kv_subtile_factor == 1, (
-        "Coarse KV blocks (kv_subtile_factor > 1) are not supported on the SM90 forward path yet."
-    )
     m_block_sparse = sparse_tensor_m_block(m_block, qhead_per_kvhead, q_subtile_factor)
 
     (
@@ -450,6 +446,7 @@ def consume_block_sparse_loads(
     warp_scheduler_barrier_arrive: Callable,
     qhead_per_kvhead: cutlass.Constexpr[int] = 1,
     q_subtile_factor: cutlass.Constexpr[int] = 1,
+    kv_subtile_factor: cutlass.Constexpr[int] = 1,
 ):
     """Consume the mask and full block lists for a single tile on the consumer side.
 
@@ -473,32 +470,44 @@ def consume_block_sparse_loads(
         m_block_sparse,
         blocksparse_tensors,
         seqlen_info,
+        kv_subtile_factor,
     )
 
     processed_any = curr_mask_block_cnt + curr_full_block_cnt > 0
+    # Each sparse block covers kv_subtile_factor physical tile_n-wide N blocks, visited in
+    # reverse like the producer. Every N block of a list's first (highest) sparse block gets
+    # the seqlen mask: the last sparse block can extend past seqlen_k by more than one tile.
+    mask_total = curr_mask_block_cnt * kv_subtile_factor
+    full_total = curr_full_block_cnt * kv_subtile_factor
+    mask_n_block = partial(
+        sparse_physical_n_block_forward, curr_mask_block_idx, kv_subtile_factor=kv_subtile_factor
+    )
+    full_n_block = partial(
+        sparse_physical_n_block_forward, curr_full_block_idx, kv_subtile_factor=kv_subtile_factor
+    )
+    mask_fn_mask_seqlen = partial(
+        mask_fn,
+        mask_mod=mask_mod,
+        mask_seqlen=True,
+        fastdiv_mods=fastdiv_mods if cutlass.const_expr(mask_mod is not None) else None,
+    )
 
     if const_expr(not intra_wg_overlap):
         if curr_mask_block_cnt > 0:
-            mask_n_block = curr_mask_block_idx[curr_mask_block_cnt - 1]
             warp_scheduler_barrier_sync()
-            kv_consumer_state = mma_one_n_block(
-                kv_consumer_state,
-                n_block=mask_n_block,
-                mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
-                mask_fn=partial(
-                    mask_fn,
-                    mask_mod=mask_mod,
-                    mask_seqlen=True,
-                    fastdiv_mods=fastdiv_mods if cutlass.const_expr(mask_mod is not None) else None,
-                ),
-                is_first_n_block=True,
-            )
-            O_should_accumulate = True
-            for i in cutlass.range(1, curr_mask_block_cnt):
-                mask_n_block = curr_mask_block_idx[curr_mask_block_cnt - 1 - i]
+            for j in cutlass.range_constexpr(kv_subtile_factor):
                 kv_consumer_state = mma_one_n_block(
                     kv_consumer_state,
-                    n_block=mask_n_block,
+                    n_block=mask_n_block(mask_total - 1 - j),
+                    mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
+                    mask_fn=mask_fn_mask_seqlen,
+                    is_first_n_block=j == 0,
+                )
+                O_should_accumulate = True
+            for i in cutlass.range(kv_subtile_factor, mask_total):
+                kv_consumer_state = mma_one_n_block(
+                    kv_consumer_state,
+                    n_block=mask_n_block(mask_total - 1 - i),
                     mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
                     mask_fn=partial(mask_fn, mask_mod=mask_mod, mask_seqlen=False),
                     is_first_n_block=False,
@@ -508,41 +517,40 @@ def consume_block_sparse_loads(
                 warp_scheduler_barrier_arrive()
 
         if curr_full_block_cnt > 0:
-            full_n_block = curr_full_block_idx[curr_full_block_cnt - 1]
             if curr_mask_block_cnt == 0:
                 warp_scheduler_barrier_sync()
-                kv_consumer_state = mma_one_n_block(
-                    kv_consumer_state,
-                    n_block=full_n_block,
-                    mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
-                    mask_fn=partial(mask_fn, mask_seqlen=True),
-                    is_first_n_block=True,
-                )
-                O_should_accumulate = True
-                for i in cutlass.range(1, curr_full_block_cnt):
-                    full_n_block = curr_full_block_idx[curr_full_block_cnt - 1 - i]
+                for j in cutlass.range_constexpr(kv_subtile_factor):
                     kv_consumer_state = mma_one_n_block(
                         kv_consumer_state,
-                        n_block=full_n_block,
+                        n_block=full_n_block(full_total - 1 - j),
+                        mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
+                        mask_fn=partial(mask_fn, mask_seqlen=True),
+                        is_first_n_block=j == 0,
+                    )
+                    O_should_accumulate = True
+                for i in cutlass.range(kv_subtile_factor, full_total):
+                    kv_consumer_state = mma_one_n_block(
+                        kv_consumer_state,
+                        n_block=full_n_block(full_total - 1 - i),
                         mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
                         mask_fn=partial(mask_fn, mask_seqlen=False),
                         is_first_n_block=False,
                     )
                     O_should_accumulate = True
             else:
-                kv_consumer_state = mma_one_n_block(
-                    kv_consumer_state,
-                    n_block=full_n_block,
-                    mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
-                    mask_fn=partial(mask_fn, mask_mod=None, mask_seqlen=True),
-                    is_first_n_block=False,
-                )
-                O_should_accumulate = True
-                for i in cutlass.range(1, curr_full_block_cnt):
-                    full_n_block = curr_full_block_idx[curr_full_block_cnt - 1 - i]
+                for j in cutlass.range_constexpr(kv_subtile_factor):
                     kv_consumer_state = mma_one_n_block(
                         kv_consumer_state,
-                        n_block=full_n_block,
+                        n_block=full_n_block(full_total - 1 - j),
+                        mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
+                        mask_fn=partial(mask_fn, mask_mod=None, mask_seqlen=True),
+                        is_first_n_block=False,
+                    )
+                    O_should_accumulate = True
+                for i in cutlass.range(kv_subtile_factor, full_total):
+                    kv_consumer_state = mma_one_n_block(
+                        kv_consumer_state,
+                        n_block=full_n_block(full_total - 1 - i),
                         mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
                         mask_fn=partial(mask_fn, mask_mod=None, mask_seqlen=False),
                         is_first_n_block=False,
@@ -551,25 +559,27 @@ def consume_block_sparse_loads(
             warp_scheduler_barrier_arrive()
     else:
         if curr_mask_block_cnt > 0:
-            mask_n_block = curr_mask_block_idx[curr_mask_block_cnt - 1]
             kv_consumer_state = process_first_half_block(
-                n_block=mask_n_block,
+                n_block=mask_n_block(mask_total - 1),
                 seqlen=seqlen_info,
                 kv_consumer_state=kv_consumer_state,
-                mask_fn=partial(
-                    mask_fn,
-                    mask_mod=mask_mod,
-                    mask_seqlen=True,
-                    fastdiv_mods=fastdiv_mods if cutlass.const_expr(mask_mod is not None) else None,
-                ),
+                mask_fn=mask_fn_mask_seqlen,
                 score_mod_fn=score_mod_fn,
                 is_first_block=True,
             )
-            for i in cutlass.range(1, curr_mask_block_cnt):
-                mask_n_block = curr_mask_block_idx[curr_mask_block_cnt - 1 - i]
+            for j in cutlass.range_constexpr(1, kv_subtile_factor):
                 kv_consumer_state = mma_one_n_block(
                     kv_consumer_state,
-                    n_block=mask_n_block,
+                    n_block=mask_n_block(mask_total - 1 - j),
+                    seqlen=seqlen_info,
+                    mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
+                    mask_fn=partial(mask_fn, mask_mod=mask_mod, mask_seqlen=True),
+                )
+                O_should_accumulate = True
+            for i in cutlass.range(kv_subtile_factor, mask_total):
+                kv_consumer_state = mma_one_n_block(
+                    kv_consumer_state,
+                    n_block=mask_n_block(mask_total - 1 - i),
                     seqlen=seqlen_info,
                     mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
                     mask_fn=partial(mask_fn, mask_mod=mask_mod, mask_seqlen=False),
@@ -577,10 +587,9 @@ def consume_block_sparse_loads(
                 O_should_accumulate = True
 
         if curr_full_block_cnt > 0:
-            full_n_block = curr_full_block_idx[curr_full_block_cnt - 1]
             if curr_mask_block_cnt == 0:
                 kv_consumer_state = process_first_half_block(
-                    n_block=full_n_block,
+                    n_block=full_n_block(full_total - 1),
                     seqlen=seqlen_info,
                     kv_consumer_state=kv_consumer_state,
                     mask_fn=partial(mask_fn, mask_mod=None, mask_seqlen=True),
@@ -590,17 +599,25 @@ def consume_block_sparse_loads(
             else:
                 kv_consumer_state = mma_one_n_block(
                     kv_consumer_state,
-                    n_block=full_n_block,
+                    n_block=full_n_block(full_total - 1),
                     seqlen=seqlen_info,
                     mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
                     mask_fn=partial(mask_fn, mask_mod=None, mask_seqlen=True),
                 )
                 O_should_accumulate = True
-            for i in cutlass.range(1, curr_full_block_cnt):
-                full_n_block = curr_full_block_idx[curr_full_block_cnt - 1 - i]
+            for j in cutlass.range_constexpr(1, kv_subtile_factor):
                 kv_consumer_state = mma_one_n_block(
                     kv_consumer_state,
-                    n_block=full_n_block,
+                    n_block=full_n_block(full_total - 1 - j),
+                    seqlen=seqlen_info,
+                    mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
+                    mask_fn=partial(mask_fn, mask_mod=None, mask_seqlen=True),
+                )
+                O_should_accumulate = True
+            for i in cutlass.range(kv_subtile_factor, full_total):
+                kv_consumer_state = mma_one_n_block(
+                    kv_consumer_state,
+                    n_block=full_n_block(full_total - 1 - i),
                     seqlen=seqlen_info,
                     mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
                     mask_fn=partial(mask_fn, mask_mod=None, mask_seqlen=False),
