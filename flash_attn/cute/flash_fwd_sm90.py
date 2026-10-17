@@ -118,13 +118,18 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         return tiled_mma_qk, tiled_mma_pv
 
     def _get_shared_storage_cls(self):
+        # The epilogue stages O in sQ's storage, so the slot must also fit O when
+        # head_dim_v > head_dim.
+        cosize_sQO = max(cute.cosize(self.sQ_layout), cute.cosize(self.sO_layout))
         sQ_struct, sK_struct, sV_struct = [
-            cute.struct.Align[
-                cute.struct.MemRange[self.dtype, cute.cosize(layout)], self.buffer_align_bytes
-            ]
-            for layout in (self.sQ_layout, self.sK_layout, self.sV_layout)
+            cute.struct.Align[cute.struct.MemRange[self.dtype, cosize], self.buffer_align_bytes]
+            for cosize in (
+                cosize_sQO,
+                cute.cosize(self.sK_layout),
+                cute.cosize(self.sV_layout),
+            )
         ]
-        cosize_sQV = max(cute.cosize(self.sQ_layout), cute.cosize(self.sV_layout))
+        cosize_sQV = max(cosize_sQO, cute.cosize(self.sV_layout))
         sQV_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, cosize_sQV], 1024]
         cosize_sP = cute.cosize(self.sP_layout) if const_expr(self.sP_layout is not None) else 0
         sP_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, cosize_sP], 1024]

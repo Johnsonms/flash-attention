@@ -157,13 +157,16 @@ def _tile_size_fwd_sm90(head_dim, head_dim_v, is_causal, is_local, sparse_block_
     When sparse_block_size_q is set, tile_m must divide it. For head_dim <= 96 the
     optimal tile_m=192 is used when compatible, otherwise we fall back to 128.
     """
-    if head_dim <= 64:
+    # Size for the larger of the two: smem and register use grow with both (dv > d would
+    # otherwise get the small-head_dim tile and overflow smem).
+    hdim = max(head_dim, head_dim_v)
+    if hdim <= 64:
         # C++: 192×192 non-causal, 192×128 causal/local.
         # Python: 192×128 RS+OL is consistently best across seqlens.
         if sparse_block_size_q is not None and sparse_block_size_q % 192 != 0:
             return FwdConfig(128, 128, True, True)
         return FwdConfig(192, 128, True, True)
-    elif head_dim <= 96:
+    elif hdim <= 96:
         # C++: 192×144 noRS+OL for all cases.
         # Python: RS is catastrophic with 192× tiles (~300 vs ~600 TFLOPS).
         # noRS+OL is always required. Causal: 192×128 slightly better short seqlen.
@@ -173,9 +176,9 @@ def _tile_size_fwd_sm90(head_dim, head_dim_v, is_causal, is_local, sparse_block_
             return FwdConfig(192, 128, False, True)
         else:
             return FwdConfig(192, 144, False, True)
-    elif head_dim <= 128:
+    elif hdim <= 128:
         return FwdConfig(128, 128, True, True)
-    elif head_dim <= 192:
+    elif hdim <= 192:
         tile_n = 96 if is_local else (128 if head_dim_v <= 128 else 112)
         return FwdConfig(128, tile_n, True, True)
     else:  # hdim 256
@@ -219,7 +222,10 @@ def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q
     Configs based on C++ FA3 hopper/flash_bwd_launch_template.h,
     benchmarked on H100 SXM.
     """
-    if head_dim <= 64:
+    # Size for the larger of the two: smem and register use grow with both (dv > d would
+    # otherwise get the small-head_dim tile and overflow smem).
+    hdim = max(head_dim, head_dim_v)
+    if hdim <= 64:
         # C++ FA3: 128, 128, 64, ..., 2, 2, true, false, false, 2, 1, 2, 2
         return BwdConfig(
             m_block_size=128, n_block_size=128,
@@ -227,7 +233,7 @@ def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q
             SdP_swapAB=True, dKV_swapAB=False, dQ_swapAB=False,
             AtomLayoutMSdP=1, AtomLayoutNdKV=2, AtomLayoutMdQ=2,
         )
-    elif head_dim <= 96:
+    elif hdim <= 96:
         # C++ FA3: 64, 128, 96, dQ_swapAB=False
         return BwdConfig(
             m_block_size=64, n_block_size=128,
@@ -236,10 +242,12 @@ def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q
             AtomLayoutMSdP=1, AtomLayoutNdKV=2, AtomLayoutMdQ=1,
             dQ_single_wg=True,
         )
-    elif head_dim <= 128:
+    elif hdim <= 128:
         # C++ FA3: causal/local: 64, 128; non-causal: 80, 128 with dQ_swapAB
         is_causal_or_local = causal or local
-        m_block_size = 64 if is_causal_or_local else 80
+        # The 80-row tile is tuned for head_dim 128; with a smaller head_dim (here only because
+        # head_dim_v is larger) tile_m * head_dim no longer splits evenly over the threads.
+        m_block_size = 64 if is_causal_or_local or head_dim <= 96 else 80
         if sparse_block_size_q is not None and sparse_block_size_q % m_block_size != 0:
             m_block_size = 64
         return BwdConfig(
@@ -250,7 +258,7 @@ def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q
             dQ_swapAB=m_block_size % 64 != 0,
             AtomLayoutMSdP=1, AtomLayoutNdKV=2, AtomLayoutMdQ=1,
         )
-    elif head_dim <= 192:
+    elif hdim <= 192:
         hdimv128 = head_dim_v <= 128
         if hdimv128:
             return BwdConfig(

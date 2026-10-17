@@ -339,6 +339,19 @@ def test_flash_attn_sm90_value_dim_smaller(d, d_v, seqlen_q, seqlen_k, mask, var
     check_sm90_hdim_padding(d, seqlen_q, seqlen_k, mask, varlen, d_v=d_v)
 
 
+@pytest.mark.skipif(not IS_SM90, reason="SM90 value-dim regression")
+@pytest.mark.parametrize(
+    "d,d_v", [(64, 128), (96, 128), (64, 160), (64, 192), (96, 256), (128, 160), (128, 256)]
+)
+@pytest.mark.parametrize("seqlen_q,seqlen_k", [(80, 211), (257, 513)])
+@pytest.mark.parametrize("mask", ["dense", "causal"])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_sm90_value_dim_larger(d, d_v, seqlen_q, seqlen_k, mask):
+    """head_dim_v > head_dim: tiles are sized for the larger dim, and the forward's O
+    staging (which reuses sQ) must fit tile_m x head_dim_v."""
+    check_sm90_hdim_padding(d, seqlen_q, seqlen_k, mask, d_v=d_v)
+
+
 @pytest.mark.skipif(not IS_SM90, reason="SM90 backward padding regression")
 @pytest.mark.parametrize(
     "d_first,d_second",
