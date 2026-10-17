@@ -45,7 +45,7 @@ from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100, DescaleT
 from flash_attn.cute.flash_fwd_sm120 import FlashAttentionForwardSm120
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
-from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
+from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90, hdim_multiple_of_sm90
 from flash_attn.cute.flash_bwd_sm100 import FlashAttentionBackwardSm100
 from flash_attn.cute.flash_bwd_sm120 import FlashAttentionBackwardSm120
 from flash_attn.cute.flash_bwd_postprocess import (
@@ -2614,7 +2614,15 @@ def _flash_attn_bwd(
         _validate_tensor(dv, "dv", v.shape, out_torch_dtype, device)
 
     # Keep accumulator allocation, zeroing, and readback aligned with SM90's swapped MMA.
-    hdim_multiple_of = 64 if arch // 10 == 9 and dKV_swapAB else 32
+    hdim_multiple_of = hdim_v_multiple_of = 32
+    if arch // 10 == 9 and dKV_swapAB:
+        wg_d_dKV = (num_threads // 128 - 1) // AtomLayoutNdKV
+        hdim_multiple_of = hdim_multiple_of_sm90(
+            head_dim, dKV_swapAB, wg_d_dKV, qhead_per_kvhead
+        )
+        hdim_v_multiple_of = hdim_multiple_of_sm90(
+            head_dim_v, dKV_swapAB, wg_d_dKV, qhead_per_kvhead
+        )
     head_dim_rounded = (head_dim + hdim_multiple_of - 1) // hdim_multiple_of * hdim_multiple_of
 
     if cu_seqlens_q is None:
@@ -2658,7 +2666,7 @@ def _flash_attn_bwd(
         # Same rounding as the kernel's tile_hdimv and the postprocess (64 with dKV_swapAB on
         # SM90): the GQA epilogue reduces tile_n * tile_hdimv fp32 values per block.
         head_dim_v_rounded = (
-            (head_dim_v + hdim_multiple_of - 1) // hdim_multiple_of * hdim_multiple_of
+            (head_dim_v + hdim_v_multiple_of - 1) // hdim_v_multiple_of * hdim_v_multiple_of
         )
         if cu_seqlens_k is None:
             dk_accum = torch.zeros(
@@ -3161,7 +3169,7 @@ def _flash_attn_bwd(
                 cluster_size=cluster_size,
                 cu_total_m_blocks=cu_total_m_blocks_k if cluster_size == 1 else None,
                 fake_mode=fake_mode,
-                hdim_multiple_of=hdim_multiple_of,
+                hdim_multiple_of=hdim_v_multiple_of,
                 accum_order=dKVaccum_order,
             )
 

@@ -43,6 +43,28 @@ from flash_attn.cute.block_sparse_utils import (
 )
 
 
+def hdim_multiple_of_sm90(
+    hdim: int, dKV_swapAB: bool, wg_d_dKV: int, qhead_per_kvhead: int = 1
+) -> int:
+    """Alignment of a head dim's tile in the SM90 backward.
+
+    Swapped dK/dV accumulators put head_dim on WGMMA's 64-row M axis, split over wg_d_dKV
+    warpgroups (2 for the hdim-256 config). Anything wider than 64 must split evenly, so
+    with wg_d_dKV = 2 e.g. 160 and 192 are padded to 256. A 64-wide tile is not split: every
+    warpgroup computes the same 64 rows. The direct dK/dV store then writes identical values,
+    which is fine, but the GQA accumulator path (epilogue + postprocess) expects each
+    warpgroup to own a distinct slice, so GQA pads it as well.
+    """
+    if not dKV_swapAB:
+        return 16
+    return 64 if hdim <= 64 and qhead_per_kvhead == 1 else 64 * wg_d_dKV
+
+
+def round_hdim_sm90(hdim: int, dKV_swapAB: bool, wg_d_dKV: int, qhead_per_kvhead: int = 1) -> int:
+    multiple_of = hdim_multiple_of_sm90(hdim, dKV_swapAB, wg_d_dKV, qhead_per_kvhead)
+    return int(math.ceil(hdim / multiple_of) * multiple_of)
+
+
 class FlashAttentionBackwardSm90:
     arch = 90
 
@@ -76,12 +98,11 @@ class FlashAttentionBackwardSm90:
         dQ_single_wg: bool = False,
     ):
         self.dtype = dtype
-        # Swapped dK/dV accumulators put head_dim on WGMMA's 64-row M axis.
-        hdim_multiple_of = 64 if dKV_swapAB else 16
-        self.tile_hdim = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
+        wg_d_dKV = (num_threads // 128 - 1) // AtomLayoutNdKV
+        self.tile_hdim = round_hdim_sm90(head_dim, dKV_swapAB, wg_d_dKV, qhead_per_kvhead)
         head_dim_v = head_dim_v if head_dim_v is not None else head_dim
         self.same_hdim_kv = head_dim == head_dim_v
-        self.tile_hdimv = int(math.ceil(head_dim_v / hdim_multiple_of) * hdim_multiple_of)
+        self.tile_hdimv = round_hdim_sm90(head_dim_v, dKV_swapAB, wg_d_dKV, qhead_per_kvhead)
         # Can save registers (and hence be faster) if we don't have to check hdim predication
         self.check_hdim_oob = head_dim != self.tile_hdim
         self.check_hdim_v_oob = head_dim_v != self.tile_hdimv

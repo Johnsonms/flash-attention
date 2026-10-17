@@ -352,6 +352,18 @@ def test_flash_attn_sm90_value_dim_larger(d, d_v, seqlen_q, seqlen_k, mask):
     check_sm90_hdim_padding(d, seqlen_q, seqlen_k, mask, d_v=d_v)
 
 
+@pytest.mark.skipif(not IS_SM90, reason="SM90 hdim-256 backward value-dim regression")
+@pytest.mark.parametrize("d,d_v", [(160, 256), (192, 256), (256, 160), (256, 192)])
+@pytest.mark.parametrize("seqlen_q,seqlen_k", [(80, 211), (257, 513)])
+@pytest.mark.parametrize("mask", ["dense", "causal"])
+@pytest.mark.parametrize("varlen", [False, True])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_sm90_hd256_value_dim(d, d_v, seqlen_q, seqlen_k, mask, varlen):
+    """The hdim-256 backward splits head_dim over two warpgroups of 64 rows, so a smaller
+    head_dim / head_dim_v wider than 64 must be padded to a multiple of 128 (192 -> 256)."""
+    check_sm90_hdim_padding(d, seqlen_q, seqlen_k, mask, varlen, d_v=d_v)
+
+
 @pytest.mark.skipif(not IS_SM90, reason="SM90 backward padding regression")
 @pytest.mark.parametrize(
     "d_first,d_second",
