@@ -2820,6 +2820,7 @@ def _flash_attn_bwd(
             aux_scalar_metadata,
             use_block_sparsity,
             q_subtile_factor,
+            spt,
             block_sparse_broadcast_pattern,
             get_broadcast_dims(q),
             get_broadcast_dims(k),
@@ -2952,6 +2953,7 @@ def _flash_attn_bwd(
                 has_aux_tensors=aux_tensors is not None,
                 q_subtile_factor=q_subtile_factor,
                 dQ_single_wg=dQ_single_wg,
+                spt=spt,
             )
         else:
             if use_dedicated_hd256_kernel:
