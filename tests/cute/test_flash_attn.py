@@ -3031,8 +3031,10 @@ def test_flash_attn_paged_hd256_sm100_tma(seqlen_q, num_splits):
     Verifies paged KV (page_table + TMA) matches the non-paged varlen reference
     and is deterministic across runs. page_size must equal tile_n=128.
     """
-    if not IS_SM100:
-        pytest.skip("SM100-specific paged hd256 test")
+    if not (IS_SM90 or IS_SM100):
+        pytest.skip("SM90/SM100 paged hd256 test")
+    if IS_SM90 and num_splits > 1:
+        pytest.skip("SplitKV is not supported on SM90")
     device = "cuda"
     dtype = torch.bfloat16
     d = 256
@@ -3100,8 +3102,8 @@ def test_flash_attn_paged_hd256_sm100_tma(seqlen_q, num_splits):
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_paged_hd256_sm100_tma_gqa(nheads_kv):
     """Paged GQA must select the same KV head as the dense reference."""
-    if not IS_SM100:
-        pytest.skip("SM100-specific paged hd256 test")
+    if not (IS_SM90 or IS_SM100):
+        pytest.skip("SM90/SM100 paged hd256 test")
     device = "cuda"
     dtype = torch.bfloat16
     d = 256
@@ -3223,8 +3225,10 @@ def test_flash_attn_paged_sm100_tma_capacity(head_dim):
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_paged_hd256_sm100_tma_seqused_k(max_seqlen_k_mode, seqlen_q, num_splits):
     """Check paged seqused_k against dense varlen for batch-max and capacity extents."""
-    if not IS_SM100:
-        pytest.skip("SM100-specific paged hd256 test")
+    if not (IS_SM90 or IS_SM100):
+        pytest.skip("SM90/SM100 paged hd256 test")
+    if IS_SM90 and num_splits > 1:
+        pytest.skip("SplitKV is not supported on SM90")
     device = "cuda"
     dtype = torch.bfloat16
     d = 256
