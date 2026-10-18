@@ -73,6 +73,7 @@ class FlashAttentionBackwardSm90:
         mask_mod: cutlass.Constexpr | None = None,
         has_aux_tensors: cutlass.Constexpr = False,
         q_subtile_factor: cutlass.Constexpr[int] = 1,
+        kv_subtile_factor: cutlass.Constexpr[int] = 1,
         dQ_single_wg: bool = False,
         spt: Optional[bool] = None,
     ):
@@ -132,6 +133,7 @@ class FlashAttentionBackwardSm90:
         self.mask_mod = mask_mod
         self.has_aux_tensors = has_aux_tensors
         self.q_subtile_factor = q_subtile_factor
+        self.kv_subtile_factor = kv_subtile_factor
         if cutlass.const_expr(has_aux_tensors):
             self.vec_size: cutlass.Constexpr = 1
         else:
@@ -953,7 +955,7 @@ class FlashAttentionBackwardSm90:
                         blocksparse_tensors,
                         batch_idx,
                         head_idx,
-                        n_block,
+                        n_block // self.kv_subtile_factor,
                         q_subtile_factor=self.q_subtile_factor,
                         m_block_max=m_block_max,
                     )
@@ -1005,7 +1007,7 @@ class FlashAttentionBackwardSm90:
                             blocksparse_tensors,
                             batch_idx,
                             head_idx,
-                            n_block,
+                            n_block // self.kv_subtile_factor,
                             producer_state_Q,
                             producer_state_dO,
                             pipeline_Q,
@@ -1366,7 +1368,7 @@ class FlashAttentionBackwardSm90:
                     blocksparse_tensors,
                     batch_idx,
                     head_idx,
-                    n_block,
+                    n_block // self.kv_subtile_factor,
                     q_subtile_factor=self.q_subtile_factor,
                     m_block_max=m_block_max,
                 )
@@ -1419,6 +1421,7 @@ class FlashAttentionBackwardSm90:
                         m_block_max=m_block_max,
                         aux_data=aux_data,
                         fastdiv_mods=fastdiv_mods,
+                        kv_subtile_factor=self.kv_subtile_factor,
                     )
 
                 if const_expr(self.qhead_per_kvhead == 1):
@@ -1857,7 +1860,7 @@ class FlashAttentionBackwardSm90:
                     blocksparse_tensors,
                     batch_idx,
                     head_idx,
-                    n_block,
+                    n_block // self.kv_subtile_factor,
                     q_subtile_factor=self.q_subtile_factor,
                     m_block_max=m_block_max,
                 )
@@ -1938,6 +1941,9 @@ class FlashAttentionBackwardSm90:
                         if const_expr(self.deterministic)
                         else None,
                         warp_local_tidx=warp_local_tidx,
+                        kv_subtile_factor=self.kv_subtile_factor,
+                        spt=self.spt,
+                        num_n_blocks=cute.ceil_div(seqlen.seqlen_k, self.tile_n),
                     )
 
             # For local masking + deterministic (non-spt): signal remaining m_blocks

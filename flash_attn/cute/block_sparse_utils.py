@@ -1799,21 +1799,25 @@ def consume_block_sparse_mma_bwd_sm90(
     m_block_max: int = 0,
     aux_data: AuxData = AuxData(),
     fastdiv_mods=(None, None),
+    kv_subtile_factor: cutlass.Constexpr = 1,
 ):
     """SM90 backward block sparse MMA consumption with separate partial/full loops.
 
     Partial blocks are processed first (with mask_mod applied), then full blocks
     (without mask_mod). This ensures mask_mod is only applied where needed.
+    A sparse KV block may span kv_subtile_factor KV tiles: its Q lists are read at
+    n_block // kv_subtile_factor while masking uses the KV tile's own n_block.
 
     Returns updated (consumer_state_Q, consumer_state_dO).
     """
     q_cnt, q_idx, full_cnt, full_idx, *_ = blocksparse_tensors
-    curr_q_cnt = q_cnt[batch_idx, head_idx, n_block]
-    curr_q_idx = q_idx[batch_idx, head_idx, n_block, None]
+    n_block_sparse = n_block // kv_subtile_factor
+    curr_q_cnt = q_cnt[batch_idx, head_idx, n_block_sparse]
+    curr_q_idx = q_idx[batch_idx, head_idx, n_block_sparse, None]
 
     if const_expr(full_cnt is not None):
-        curr_full_cnt = full_cnt[batch_idx, head_idx, n_block]
-        curr_full_idx = full_idx[batch_idx, head_idx, n_block, None]
+        curr_full_cnt = full_cnt[batch_idx, head_idx, n_block_sparse]
+        curr_full_idx = full_idx[batch_idx, head_idx, n_block_sparse, None]
     else:
         curr_full_cnt = Int32(0)
         curr_full_idx = None
@@ -1896,6 +1900,7 @@ def _store_one_dQaccum_sm90(
     mdQ_semaphore_cur: Optional[cute.Tensor] = None,
     lock_value=None,
     warp_local_tidx=None,
+    release_inc=1,
 ):
     """Store dQaccum for a single m_block.
 
@@ -1924,7 +1929,9 @@ def _store_one_dQaccum_sm90(
         cute.arch.cp_async_bulk_commit_group()
     if const_expr(mdQ_semaphore_cur is not None):
         cute.arch.cp_async_bulk_wait_group(0, read=False)
-        barrier.arrive_inc(mdQ_semaphore_cur[(m_block, None)].iterator, warp_local_tidx, 0, 1)
+        barrier.arrive_inc(
+            mdQ_semaphore_cur[(m_block, None)].iterator, warp_local_tidx, 0, release_inc
+        )
 
 
 @cute.jit
@@ -1942,20 +1949,25 @@ def dQaccum_store_block_sparse_bwd_sm90(
     tma_copy_bytes_dQ,
     mdQ_semaphore_cur: Optional[cute.Tensor] = None,
     warp_local_tidx=None,
+    kv_subtile_factor: cutlass.Constexpr = 1,
+    spt: cutlass.Constexpr = False,
+    num_n_blocks=None,
 ):
     """SM90 backward block sparse dQaccum store with separate partial/full loops.
 
     Iterates partial blocks first, then full blocks, matching producer/consumer order.
     With mdQ_semaphore_cur (deterministic), each store is ordered by dq_write_order: the
-    rank of this KV block among the sparse Q block's contributors.
+    rank of this KV block among the sparse Q block's contributors. A sparse KV block
+    spanning kv_subtile_factor KV tiles gives each tile its own slot within that rank.
     """
     q_cnt, q_idx, full_cnt, full_idx, *_ = blocksparse_tensors
-    curr_q_cnt = q_cnt[batch_idx, head_idx, n_block]
-    curr_q_idx = q_idx[batch_idx, head_idx, n_block, None]
+    n_block_sparse = n_block // kv_subtile_factor
+    curr_q_cnt = q_cnt[batch_idx, head_idx, n_block_sparse]
+    curr_q_idx = q_idx[batch_idx, head_idx, n_block_sparse, None]
 
     if const_expr(full_cnt is not None):
-        curr_full_cnt = full_cnt[batch_idx, head_idx, n_block]
-        curr_full_idx = full_idx[batch_idx, head_idx, n_block, None]
+        curr_full_cnt = full_cnt[batch_idx, head_idx, n_block_sparse]
+        curr_full_idx = full_idx[batch_idx, head_idx, n_block_sparse, None]
     else:
         curr_full_cnt = Int32(0)
         curr_full_idx = None
@@ -1963,12 +1975,29 @@ def dQaccum_store_block_sparse_bwd_sm90(
     deterministic = const_expr(mdQ_semaphore_cur is not None)
     curr_write_order = None
     curr_write_order_full = None
+    local_slot = Int32(0)
+    release_inc = Int32(1)
     if const_expr(deterministic):
-        curr_write_order = blocksparse_tensors.dq_write_order[batch_idx, head_idx, n_block, None]
+        curr_write_order = blocksparse_tensors.dq_write_order[
+            batch_idx, head_idx, n_block_sparse, None
+        ]
         if const_expr(full_cnt is not None):
             curr_write_order_full = blocksparse_tensors.dq_write_order_full[
-                batch_idx, head_idx, n_block, None
+                batch_idx, head_idx, n_block_sparse, None
             ]
+        if const_expr(kv_subtile_factor > 1):
+            local_slot = n_block % kv_subtile_factor
+            if const_expr(spt):
+                # See [NOTE] KV_subtile determ + spt in flash_bwd_sm100.py: reverse the slots
+                # within the sparse block, and let the tail block's last writer skip the slots
+                # of KV tiles past seqlen_k that never run.
+                tiles_in_own_block = cutlass.min(
+                    kv_subtile_factor, num_n_blocks - n_block_sparse * kv_subtile_factor
+                )
+                local_slot = tiles_in_own_block - 1 - local_slot
+                tail_sparse_block = (num_n_blocks - 1) // kv_subtile_factor
+                if n_block_sparse == tail_sparse_block and n_block % kv_subtile_factor == 0:
+                    release_inc = Int32(1) + kv_subtile_factor - tiles_in_own_block
 
     for iter_idx in cutlass.range(curr_q_cnt * q_subtile_factor, unroll=1):
         sparse_idx = iter_idx // q_subtile_factor
@@ -1984,8 +2013,11 @@ def dQaccum_store_block_sparse_bwd_sm90(
                 num_threads_per_warp_group,
                 tma_copy_bytes_dQ,
                 mdQ_semaphore_cur,
-                curr_write_order[sparse_idx] if const_expr(deterministic) else None,
+                curr_write_order[sparse_idx] * kv_subtile_factor + local_slot
+                if const_expr(deterministic)
+                else None,
                 warp_local_tidx,
+                release_inc,
             )
 
     if const_expr(full_cnt is not None):
@@ -2003,6 +2035,9 @@ def dQaccum_store_block_sparse_bwd_sm90(
                     num_threads_per_warp_group,
                     tma_copy_bytes_dQ,
                     mdQ_semaphore_cur,
-                    curr_write_order_full[sparse_idx] if const_expr(deterministic) else None,
+                    curr_write_order_full[sparse_idx] * kv_subtile_factor + local_slot
+                    if const_expr(deterministic)
+                    else None,
                     warp_local_tidx,
+                    release_inc,
                 )

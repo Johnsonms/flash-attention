@@ -2684,7 +2684,7 @@ def _setup_block_sparse_deterministic_validation_case():
     return q, k, v, out_cute, lse_cute, torch.randn_like(out_cute), block_sparse_mask_bwd, tile_m, tile_n
 
 
-@pytest.mark.skipif(COMPUTE_CAPABILITY != 10, reason="SM100-only deterministic coarse-KV repro")
+@pytest.mark.skipif(COMPUTE_CAPABILITY not in (9, 10), reason="SM90/SM100 deterministic coarse-KV repro")
 def test_block_sparse_bwd_deterministic_kv_subtile_repro():
     torch.manual_seed(42)
     batch_size = 1
@@ -2790,7 +2790,7 @@ def test_block_sparse_bwd_deterministic_kv_subtile_repro():
     assert torch.equal(dv1, dv0)
 
 
-@pytest.mark.skipif(COMPUTE_CAPABILITY != 10, reason="SM100-only deterministic coarse-KV SPT test")
+@pytest.mark.skipif(COMPUTE_CAPABILITY not in (9, 10), reason="SM90/SM100 deterministic coarse-KV SPT test")
 @pytest.mark.parametrize(
     "seqlen,sparse_tile_n",
     [

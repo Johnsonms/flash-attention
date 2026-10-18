@@ -2376,6 +2376,7 @@ def _flash_attn_bwd(
         AtomLayoutMdQ = cfg.AtomLayoutMdQ
         num_threads = (cfg.num_wg + 1) * 128
         dQ_single_wg = cfg.dQ_single_wg
+        kv_subtile_factor = get_kv_subtile_factor(block_sparse_tensors, n_block_size)
         cluster_size = 1
         use_2cta_instrs = False
         dQaccum_order = dKVaccum_order = None
@@ -2825,6 +2826,7 @@ def _flash_attn_bwd(
             aux_scalar_metadata,
             use_block_sparsity,
             q_subtile_factor,
+            kv_subtile_factor,
             spt,
             block_sparse_broadcast_pattern,
             get_broadcast_dims(q),
@@ -2957,6 +2959,7 @@ def _flash_attn_bwd(
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
                 q_subtile_factor=q_subtile_factor,
+                kv_subtile_factor=kv_subtile_factor,
                 dQ_single_wg=dQ_single_wg,
                 spt=spt,
             )
