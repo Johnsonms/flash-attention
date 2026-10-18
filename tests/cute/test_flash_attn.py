@@ -3158,8 +3158,8 @@ def test_flash_attn_paged_hd256_sm100_tma_gqa(nheads_kv):
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_paged_sm100_tma_capacity(head_dim):
     """Paged KV remaps shuffled pages and attends full capacity without seqused_k."""
-    if not IS_SM100:
-        pytest.skip("SM100-specific paged KV test")
+    if not (IS_SM90 or IS_SM100):
+        pytest.skip("SM90/SM100 paged KV test")
     device = "cuda"
     dtype = torch.bfloat16
     d = head_dim

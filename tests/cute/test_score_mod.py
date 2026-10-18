@@ -535,7 +535,7 @@ def _generate_block_kvcache(seqlen_k, page_size, batch_size, nheads_k, d, device
     ],
 )
 @pytest.mark.parametrize("score_mod_pair", TEST_PAIRS)
-@pytest.mark.skipif(COMPUTE_CAPABILITY != 10, reason="Paged KV cache only supported on SM100")
+@pytest.mark.skipif(COMPUTE_CAPABILITY not in (9, 10), reason="Paged KV cache only supported on SM90/SM100")
 def test_score_mod_with_paged_kvcache(
     seqlen_q,
     seqlen_kv,
@@ -545,8 +545,6 @@ def test_score_mod_with_paged_kvcache(
     dtype,
     score_mod_pair,
 ):
-    if COMPUTE_CAPABILITY == 9:
-        pytest.xfail("Paged KV cache only supported on SM100")
     if page_size is not None and seqlen_kv % page_size != 0:
         pytest.skip()
 
@@ -684,7 +682,7 @@ def test_score_mod_with_paged_kvcache(
     ],
 )
 @pytest.mark.parametrize("score_mod_pair", TEST_PAIRS_WITH_AUX_TENSORS)
-@pytest.mark.skipif(COMPUTE_CAPABILITY != 10, reason="Paged KV cache only supported on SM100")
+@pytest.mark.skipif(COMPUTE_CAPABILITY not in (9, 10), reason="Paged KV cache only supported on SM90/SM100")
 def test_score_mod_with_paged_kvcache_aux_tensors(
     seqlen_q,
     seqlen_kv,
@@ -694,8 +692,6 @@ def test_score_mod_with_paged_kvcache_aux_tensors(
     dtype,
     score_mod_pair,
 ):
-    if COMPUTE_CAPABILITY == 9:
-        pytest.xfail("Paged KV cache only supported on SM100")
     if page_size is not None and seqlen_kv % page_size != 0:
         pytest.skip()
 
