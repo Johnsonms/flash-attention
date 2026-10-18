@@ -972,8 +972,8 @@ def test_cute_mask_mod_vectorized(
 
 def test_sm100_block_sparse_sink_all_masked():
     """Block-sparse regression for the sink path"""
-    if torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("SM100-only test")
+    if torch.cuda.get_device_capability()[0] not in (9, 10):
+        pytest.skip("SM90/SM100-only test")
     device = "cuda"
     dtype = torch.bfloat16
     batch_size = 1
@@ -1018,8 +1018,8 @@ def test_sm100_block_sparse_sink_all_masked():
 def test_sm100_block_sparse_empty_tile_writes_real_zeros():
     """Regression for #2906: an empty block-sparse Q tile must write real zeros,
     not scale unread TMEM residue (0.0 * inf = NaN)."""
-    if torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("SM100-only test")
+    if torch.cuda.get_device_capability()[0] not in (9, 10):
+        pytest.skip("SM90/SM100-only test")
     device = "cuda"
     dtype = torch.bfloat16
     batch_size, nheads, headdim = 2, 16, 128
@@ -1319,7 +1319,7 @@ def test_sm100_block_sparse_q_stage1():
     assert observed.get("q_stage") == 1
 
 
-@pytest.mark.skipif(COMPUTE_CAPABILITY != 10, reason="SM100-only test")
+@pytest.mark.skipif(COMPUTE_CAPABILITY not in (9, 10), reason="SM90/SM100-only test")
 def test_sm100_block_sparse_coarse_blocks():
     torch.manual_seed(42)
     seqlen_q = 512
@@ -1491,7 +1491,7 @@ def test_sm100_block_sparse_coarse_kv_masks_tail_subtiles(headdim):
     assert_fwd_matches_reference(out_cute, out_ref_fp32, out_ref)
 
 
-@pytest.mark.skipif(COMPUTE_CAPABILITY != 10, reason="SM100-only test")
+@pytest.mark.skipif(COMPUTE_CAPABILITY not in (9, 10), reason="SM90/SM100-only test")
 def test_sm100_block_sparse_coarse_blocks_mismatch():
     torch.manual_seed(0)
     seqlen_q = 1024
@@ -2246,7 +2246,7 @@ def test_gqa_expand_stride_zero_bug():
     assert cute_dv_err <= bwd_rtol * pt_dv_err + dv_atol, f"dV error too large: {cute_dv_err:.2e}"
 
 
-@pytest.mark.skipif(COMPUTE_CAPABILITY not in (10, 11), reason="SM100/SM110 persistent forward only")
+@pytest.mark.skipif(COMPUTE_CAPABILITY not in (9, 10, 11), reason="SM90/SM100/SM110 forward only")
 def test_persistent_blocksparse_empty_tiles():
     """Regression test for persistent forward deadlock with highly-sparse block masks.
 
