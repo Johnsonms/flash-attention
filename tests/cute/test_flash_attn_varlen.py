@@ -120,6 +120,7 @@ def check_varlen_vs_torch_flash(
 
     q_fa, k_fa, v_fa = map(clone_like, (q, k, v))
     q_t,  k_t,  v_t  = map(clone_like, (q, k, v))
+    q_r, k_r, v_r = (clone_like(t.float()) for t in (q, k, v))
 
     if cu_seqlens_q is not None:
         cu_seqlens_q_fa = cu_seqlens_q.clone()
@@ -149,21 +150,30 @@ def check_varlen_vs_torch_flash(
         pack_gqa=None,
     )
 
-    out_t = torch_flash_ref(
-        q_t, k_t, v_t,
-        cu_seqlens_q=cu_seqlens_q_t,
-        cu_seqlens_k=cu_seqlens_k_t,
-        seqused_q=seqused_q,
-        seqused_k=seqused_k,
-        total_q=total_q,
-        total_k=total_k,
-        softmax_scale=softmax_scale,
-        causal=causal,
-        mha_type=mha_type,
-    )
+    ref_kwargs = {
+        "cu_seqlens_q": cu_seqlens_q_t,
+        "cu_seqlens_k": cu_seqlens_k_t,
+        "seqused_q": seqused_q,
+        "seqused_k": seqused_k,
+        "total_q": total_q,
+        "total_k": total_k,
+        "softmax_scale": softmax_scale,
+        "causal": causal,
+        "mha_type": mha_type,
+    }
+    out_t = torch_flash_ref(q_t, k_t, v_t, **ref_kwargs)
+    out_r = torch_flash_ref(q_r, k_r, v_r, **ref_kwargs)
 
+    def close(fa, t, ref):
+        # Measure against the fp32 reference: within the fixed tolerance, or no worse than
+        # twice the error of the same reference in q.dtype. A fixed tolerance alone is too
+        # tight for large gradients (hdim 256 GQA dK/dV in bf16 miss it with torch's own
+        # bf16 reference), and comparing two low-precision results double-counts rounding.
+        if torch.allclose(fa.float(), ref, atol=atol, rtol=rtol):
+            return True
+        return (fa.float() - ref).abs().max() <= 2 * (t.float() - ref).abs().max()
 
-    ok_fwd = torch.allclose(out_fa.float(), out_t.float(), atol=atol, rtol=rtol)
+    ok_fwd = close(out_fa, out_t, out_r)
     if not ok_fwd:
         return False
 
@@ -180,16 +190,12 @@ def check_varlen_vs_torch_flash(
     # Ref bwd
     out_t.backward(grad_t, retain_graph=False)
     dq_t, dk_t, dv_t = q_t.grad, k_t.grad, v_t.grad
+    out_r.backward(grad_out.float(), retain_graph=False)
+    dq_r, dk_r, dv_r = q_r.grad, k_r.grad, v_r.grad
 
-    # mean_ok_q = _stats("dQ", dq_fa, dq_t, atol=atol, rtol=rtol)
-    # mean_ok_k = _stats("dK", dk_fa, dk_t, atol=atol, rtol=rtol)
-    # mean_ok_v = _stats("dV", dv_fa, dv_t, atol=atol, rtol=rtol)
-
-    # return mean_ok_q and mean_ok_k and mean_ok_v
-
-    ok_q = torch.allclose(dq_fa.float(), dq_t.float(), atol=atol, rtol=rtol)
-    ok_k = torch.allclose(dk_fa.float(), dk_t.float(), atol=atol, rtol=rtol)
-    ok_v = torch.allclose(dv_fa.float(), dv_t.float(), atol=atol, rtol=rtol)
+    ok_q = close(dq_fa, dq_t, dq_r)
+    ok_k = close(dk_fa, dk_t, dk_r)
+    ok_v = close(dv_fa, dv_t, dv_r)
     # print(f"Close? dQ={ok_q}, dK={ok_k}, dV={ok_v}")
     return ok_q and ok_k and ok_v
 
