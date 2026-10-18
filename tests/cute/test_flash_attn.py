@@ -2979,8 +2979,6 @@ def test_flash_attn_paged_deepseek(seqlen_q, page_size):
     """Regression test: paged non-TMA with DeepSeek MLA shape (d=192, dv=128).
     seqlen_q<=128 triggers q_stage=1, seqlen_q>128 triggers q_stage=2.
     """
-    if IS_SM90:
-        pytest.skip("paged KV not supported on SM90")
     device = "cuda"
     dtype = torch.bfloat16
     d, dv = 192, 128
@@ -3378,9 +3376,6 @@ def test_flash_attn_seqlen_k_zero(seqlen_q, d, causal):
     are not exercised here: per-batch empty slots are already handled
     by the kernel's fake-iteration path and do not hit either invariant.
     """
-    if IS_SM90:
-        pytest.skip("SM90 uses a different kernel path")
-
     device = "cuda"
     dtype = torch.bfloat16
     dv = 128 if d == 192 else d
