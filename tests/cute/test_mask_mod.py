@@ -638,7 +638,7 @@ def test_q_boundary_masking_block_sparse_bwd(seqlen_q, seqlen_k, mask_name):
     )
 
 
-@pytest.mark.skipif(COMPUTE_CAPABILITY != 10, reason="Test uses SM100 block mask conventions (2*tile_m)")
+@pytest.mark.skipif(COMPUTE_CAPABILITY not in (9, 10), reason="Block-sparse backward is SM90/SM100-only")
 def test_single_doc_bwd_minimal():
     """Minimal test to isolate single-document backward pass bug.
 
@@ -2883,7 +2883,7 @@ def test_block_sparse_bwd_deterministic_spt_kv_subtile(seqlen, sparse_tile_n):
     )
 
 
-@pytest.mark.skipif(COMPUTE_CAPABILITY != 10, reason="SM100-only compile-key regression")
+@pytest.mark.skipif(COMPUTE_CAPABILITY not in (9, 10), reason="SM90/SM100 compile-key regression")
 def test_sm100_block_sparse_bwd_q_subtile_compile_key():
     """Two bwd calls differing only in sparse_block_size_q must not share a kernel.
 
