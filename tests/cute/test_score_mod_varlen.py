@@ -1344,7 +1344,12 @@ def _check_grad(name, cute_grad, ref_fp32, pt_grad, dtype, rtol=3, extra=1e-3):
     assert not torch.isnan(cute_grad).any(), f"{name} contains NaN"
     atol = 2 * (ref_fp32 + 0.3 - 0.3 - ref_fp32).abs().max().item() + extra
     ref = ref_fp32.to(dtype)
-    pt_err = (pt_grad - ref).abs().max().item()
+    # Rounding the largest gradient to dtype alone can cost half a spacing; a dtype
+    # reference that lands closer got lucky, so floor its error there.
+    pt_err = max(
+        (pt_grad - ref).abs().max().item(),
+        0.5 * torch.finfo(dtype).eps * ref_fp32.abs().max().item(),
+    )
     cute_err = (cute_grad - ref).abs().max().item()
     print(f"  {name}: PT err={pt_err:.2e}, CuTE err={cute_err:.2e}, atol={atol:.2e}")
     assert cute_err <= rtol * pt_err + atol, (
