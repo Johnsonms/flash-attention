@@ -300,6 +300,7 @@ _LEGACY_SM100_TUNING = {
     (False, True, 128, True): (176, 64),
     (True, False, 192, True): (176, 64),
     (False, True, 192, True): (176, 72),
+    (False, False, 96, True): (176, 80),
     (True, False, 256, False): (256, 160),
     (True, True, 256, False): (256, 160),
 }
