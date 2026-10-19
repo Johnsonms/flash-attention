@@ -2412,13 +2412,15 @@ def _flash_attn_bwd(
         dQaccum_order, dKVaccum_order = FlashAttentionBackwardSm100.accum_tile_orders(
             use_2cta_instrs, n_block_size
         )
-        # hdim 256 (64-row KV tile, serial schedule) and block-sparse hdim 192 need 2CTA.
+        # hdim 256 (64-row KV tile, serial schedule) and hdim 192 need 2CTA.
         needs_2cta = (
             "SM100 backward with head_dim=256"
             if hd256_generic
             else (
                 "SM100 block-sparse backward with head_dim=192"
                 if block_sparse_tensors is not None and head_dim == 192
+                else "SM100 backward with head_dim=192"
+                if head_dim == 192
                 else None
             )
         )

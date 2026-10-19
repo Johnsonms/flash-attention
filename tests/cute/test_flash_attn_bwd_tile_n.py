@@ -14,6 +14,7 @@ import torch
 
 from eager_reference import check_against_reference, make_cu_seqlens
 
+from flash_attn.cute import utils
 from flash_attn.cute.interface import flash_attn_func, flash_attn_varlen_func
 from score_mod_definitions import score_mod_bwd_rel_bias, score_mod_rel_bias
 
@@ -256,3 +257,23 @@ def test_bwd_tile_n_64_head_dim_v(
     # GQA on the 128-row 2CTA tile does not compile for head_dim_v != head_dim (its fp32 dV
     # staging is sized by head_dim), so every case is also checked against the eager reference.
     check_against_reference(got, q, k, v, dout, q_lens, k_lens, causal, dtype)
+
+
+def test_hdim192_backward_with_2cta_disabled_raises(monkeypatch):
+    """hdim 192 has no 1CTA backward: FA_DISABLE_2CTA=1 must fail with a clear error, not the
+    kernel's internal assert."""
+    monkeypatch.setattr(utils, "_fa_disable_2cta_enabled", True)
+    q, k = (
+        torch.randn(
+            1, 256, 2, 192, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        for _ in range(2)
+    )
+    v = torch.randn(
+        1, 256, 2, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True
+    )
+    out, _ = flash_attn_func(q, k, v)
+    with pytest.raises(
+        ValueError, match="head_dim=192 requires 2CTA; 2CTA was disabled by request"
+    ):
+        out.sum().backward()
