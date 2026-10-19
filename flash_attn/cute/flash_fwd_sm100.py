@@ -244,12 +244,12 @@ class FlashAttentionForwardSm100:
         # despite the literal `is_sm103` name.
         is_sm103 = self.arch.is_family_of(Arch.sm_103f)
         self.is_sm103 = is_sm103
-        # SM103 ld.red is profitable except for D32 when scores are unmodified.
+        # SM103 ld.red is profitable when scores are unmodified, except for unmasked D32.
         self.use_ldred_rowmax = (
             is_sm103
             and self.score_mod is None
             and self.mask_mod is None
-            and self.head_dim_padded != 32
+            and (self.head_dim_padded != 32 or self.is_causal or self.is_local)
         )
         # enable_ex2_emu is derived: True if tuning config has freq > 0, else fallback to default logic
         _default_enable_ex2_emu = (self.head_dim_padded <= 128 or (self.head_dim_padded == 192 and self.use_2cta_instrs and not self.is_causal and not self.is_local)) and not is_sm103
