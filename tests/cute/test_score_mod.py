@@ -424,7 +424,12 @@ def test_cute_vs_flex_attention_with_aux_tensors(
     rtol = 2
 
     # Calculate actual errors
-    pt_error = (out_pt - out_ref_fp32).abs().max().item()
+    # Rounding the largest output to dtype alone can cost half a spacing; a dtype
+    # reference that lands closer got lucky, so floor its error there.
+    pt_error = max(
+        (out_pt - out_ref_fp32).abs().max().item(),
+        0.5 * torch.finfo(dtype).eps * out_ref_fp32.abs().max().item(),
+    )
     cute_error = (out_cute - out_ref_fp32).abs().max().item()
 
     print(f"\nNumerical comparison for {cute_score_mod.__name__}:")
