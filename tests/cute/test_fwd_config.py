@@ -308,7 +308,7 @@ _LEGACY_SM100_TUNING = {
 def legacy_sm100_registers(fp8, hd_padded, causal, use_2cta, sm103, paged_non_tma, q_stage):
     key = (use_2cta, causal, hd_padded, sm103)
     if hd_padded < 96:
-        regs = (184, 64, 80) if paged_non_tma else (200, 64, 48)
+        regs = (184, 64, 80) if paged_non_tma or (sm103 and hd_padded == 64) else (200, 64, 48)
     else:
         if not paged_non_tma and key in _LEGACY_SM100_TUNING:
             softmax, correction = _LEGACY_SM100_TUNING[key]

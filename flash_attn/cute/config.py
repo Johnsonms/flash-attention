@@ -312,8 +312,11 @@ def select_sm100_registers(
     key = (use_2cta_instrs, inputs.causal, head_dim_padded, sm100_is_sm103_family(inputs.device_arch))
     is_fp8 = "float8" in inputs.dtype
     if head_dim_padded < 96:
-        small = SM100_FP8_SMALL_HDIM_REGISTERS if is_fp8 else SM100_SMALL_HDIM_REGISTERS
-        return small[paged_kv_non_tma]
+        if is_fp8:
+            return SM100_FP8_SMALL_HDIM_REGISTERS[paged_kv_non_tma]
+        # SM103 hdim 64 uses the paged non-TMA split (other warp groups at 80).
+        sm103_hd64 = sm100_is_sm103_family(inputs.device_arch) and head_dim_padded == 64
+        return SM100_SMALL_HDIM_REGISTERS[paged_kv_non_tma or sm103_hd64]
     fp8_tune = SM100_FP8_TUNING.get(key, {}) if is_fp8 else {}
     if not paged_kv_non_tma and "num_regs_softmax" in fp8_tune:
         softmax, correction = fp8_tune["num_regs_softmax"], fp8_tune["num_regs_correction"]

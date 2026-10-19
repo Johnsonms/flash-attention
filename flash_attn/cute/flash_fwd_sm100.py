@@ -380,9 +380,11 @@ class FlashAttentionForwardSm100:
         if "ex2_emu_freq" in self._tune:
             self.enable_ex2_emu = self._tune["ex2_emu_freq"] > 0
         if self.head_dim_padded < 96:
-            self.num_regs_softmax = 200 if not paged_kv_non_tma else 184
+            # SM103 hdim 64 is 14-17% faster non-causal when the other warp groups get 80.
+            small_regs_other_80 = paged_kv_non_tma or (self.is_sm103 and self.head_dim_padded == 64)
+            self.num_regs_softmax = 200 if not small_regs_other_80 else 184
             self.num_regs_correction = 64
-            self.num_regs_other = 48 if not paged_kv_non_tma else 80
+            self.num_regs_other = 48 if not small_regs_other_80 else 80
         else:
             if not paged_kv_non_tma and "num_regs_softmax" in self._tune:
                 self.num_regs_softmax = self._tune["num_regs_softmax"]
