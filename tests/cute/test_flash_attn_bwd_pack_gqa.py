@@ -21,7 +21,6 @@ import torch
 
 from eager_reference import check_against_reference, make_cu_seqlens
 
-from flash_attn.cute import utils
 from flash_attn.cute.interface import flash_attn_func, flash_attn_varlen_func
 
 pytestmark = pytest.mark.skipif(
@@ -82,11 +81,6 @@ def pack_gqa_env():
             os.environ[key] = value
 
 
-def hd256_on_general_kernel():
-    getter = getattr(utils, "_get_hd256_generic_bwd", None)
-    return getter is None or getter()
-
-
 def run_fwd_bwd_layout(
     layout, q, k, v, dout, q_lens, k_lens, causal, pack, head_loop, pack_factor=None, **kwargs
 ):
@@ -135,8 +129,6 @@ def run_fwd_bwd_layout(
 def test_bwd_pack_gqa_matches_unpacked(
     q_lens, k_lens, head_dim, mha_type, fold, layout, feature, causal, pack_gqa_env
 ):
-    if head_dim == 256 and not hd256_on_general_kernel():
-        pytest.skip("hdim 256 backward runs on the dedicated kernels (no packing)")
     pack, head_loop, pack_factor = FOLDS[fold]
     heads_q, heads_kv = HEADS[mha_type]
     qhead_per_kvhead = heads_q // heads_kv
