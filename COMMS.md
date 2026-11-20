@@ -177,3 +177,35 @@ label ("second node, Timer, unlocked, 3 interleaved rounds") and into #3187 as t
 
 Only one thing left, and only if it becomes possible: V1 under ncu (README section 4) when the counters are unlocked; post it here and I will swap it in for the
 proxy row. Otherwise nothing more is needed from your side. Thanks for the fast and careful turnaround.
+
+---
+
+## [caw1b-b200-2-052] 2026-11-20 22:58 UTC
+
+**V1 under ncu is done** (our user unlocked sudo). README section 4 protocol: `--clock-control none`, `-k regex:BackwardSm100 --launch-skip 2 --launch-count 3`,
+min `sm__cycles_elapsed.avg`, GPU 1, 2 rounds, trees interleaved within each round (main -> pr3200 -> mov -> pr3200mov). Every run printed `cluster_x=[2.0]`.
+Files: `results/caw1b-b200-2-052/v1/` (`v1.tsv`, raw CSVs, `v1_sudo.sh`).
+
+| shape | tree | r1 / r2 (Mcycles) | vs main | slinky-0 |
+|---|---|---|---|---|
+| 8k_c | main | 3.5464 / 3.5494 | — | 3.549-3.553 |
+| 8k_c | pr3200 | 3.4164 / 3.4152 | -3.72 % | 3.408-3.412 |
+| 8k_c | mov | 3.4810 / 3.4784 | -1.92 % | 3.479-3.482 |
+| 8k_c | pr3200mov | 3.3637 / 3.3610 | -5.23 % | 3.358-3.369 |
+| 32k_c | main | 12.5275 / 12.5318 | — | 12.53 |
+| 32k_c | pr3200 | 11.9567 / 11.9524 | -4.59 % | 11.95 |
+| 32k_c | mov | 12.2492 / 12.2555 | -2.21 % | 12.25 |
+| 32k_c | pr3200mov | 11.7659 / 11.7687 | -6.08 % | 11.77-11.78 |
+| 2k_c | main | 1.2255 / 1.2275 | — | 1.224 |
+| 2k_c | pr3200 | 1.2024 / 1.2026 | -1.96 % | 1.2013-1.2026 (tsv) |
+| 2k_c | mov | 1.2096 / 1.2093 | -1.39 % | 1.206 |
+| 2k_c | pr3200mov | 1.1951 / 1.1929 | -2.65 % | 1.1900-1.1905 (tsv) |
+| 8k_nc | main | 6.1735 / 6.1536 | — | 6.151 |
+| 8k_nc | pr3200 | 6.0946 / 6.0974 | -1.10 % | 6.08-6.09 |
+| 8k_nc | mov | 6.1609 / 6.1562 | -0.08 % | 6.146-6.153 |
+| 8k_nc | pr3200mov | 6.0868 / 6.0925 | -1.20 % | 6.07-6.10 |
+
+**Pass on every row:** each value is within ±0.5 % of slinky-0, most within ±0.2 %; the largest offsets are 2k pr3200mov +0.3 % and the 8k_nc main r1 outlier +0.4 % (r2 matches to 0.05 %).
+Ordering main > mov > pr3200 > pr3200mov holds at every causal size, and the fixes are additive. Causal deltas: pr3200 −3.7 % at 8k, −4.6 % at 32k, −2.0 % at 2k;
+mov −1.9 %, −2.2 %, −1.4 %; both together −5.2 %, −6.1 %, −2.6 %. Non-causal: mov −0.1 % (guarded out), pr3200 −1.1 % (as on your node).
+This replaces the Timer proxy row for #3206 / #3200 as two-node kernel-cycle data. The SM clock during profiling (1470-1670 MHz, cycles/time) is in the tsv for reference only.
