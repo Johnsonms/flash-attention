@@ -305,6 +305,7 @@ class Softmax(ParamsBase):
 class SoftmaxSm100(Softmax):
     rescale_threshold: cutlass.Constexpr[float] = 0.0
     max_offset: cutlass.Constexpr[int] = 0
+    row_sum_unquantized: cute.Tensor | None = None
 
     @staticmethod
     def create(
@@ -312,6 +313,7 @@ class SoftmaxSm100(Softmax):
         rescale_threshold: cutlass.Constexpr[float] = 0.0,
         softmax_scale: Float32 | None = None,
         max_offset: cutlass.Constexpr[int] = 0,
+        track_unquantized_sum: cutlass.Constexpr[bool] = False,
     ):
         num_rows = 1
         arch = 100
@@ -326,6 +328,9 @@ class SoftmaxSm100(Softmax):
             softmax_scale,
             rescale_threshold=rescale_threshold,
             max_offset=max_offset,
+            row_sum_unquantized=cute.make_rmem_tensor(num_rows, Float32)
+            if cutlass.const_expr(track_unquantized_sum)
+            else None,
         )
 
     @cute.jit
@@ -401,6 +406,70 @@ class SoftmaxSm100(Softmax):
         # self.row_sum[0] = self.row_sum[0] * row_scale + tmp
 
     @cute.jit
+    def update_row_sum_quantized(
+        self,
+        p_fp32: cute.TensorSSA,
+        p_quantized: cute.TensorSSA,
+        row_scale: Float32,
+        is_first: int = False,
+        use_mixed_sum: cutlass.Constexpr[bool] = False,
+    ) -> None:
+        """Normalize O with the P consumed by PV, while retaining FP32 LSE statistics."""
+        if cutlass.const_expr(self.row_sum_unquantized is not None):
+            init_val = (
+                self.row_sum_unquantized[0] * row_scale
+                if cutlass.const_expr(not is_first)
+                else None
+            )
+            self.row_sum_unquantized[0] = self._compute_row_sum(p_fp32, init_val=init_val)
+        if cutlass.const_expr(use_mixed_sum):
+            # E4M3 is exact in FP16. sm_107 can add each FP16 pair directly into
+            # FP32, avoiding a scalar half->float conversion for every key.
+            p = cute.make_rmem_tensor(p_quantized.shape, cutlass.Float16)
+            p.store(p_quantized)
+            init = self.row_sum[0] * row_scale if cutlass.const_expr(not is_first) else Float32(0.0)
+            sums = [(init, Float32(0.0))] + [(Float32(0.0), Float32(0.0))] * 3
+            for i in cutlass.range_constexpr(0, cute.size(p), 8):
+                for j in cutlass.range_constexpr(4):
+                    sums[j] = cute.arch.add_packed_f32x2_f16x2_f32x2(
+                        (p[i + 2 * j], p[i + 2 * j + 1]),
+                        sums[j],
+                    )
+            sums[0] = cute.arch.add_packed_f32x2(sums[0], sums[1])
+            sums[2] = cute.arch.add_packed_f32x2(sums[2], sums[3])
+            sums[0] = cute.arch.add_packed_f32x2(sums[0], sums[2])
+            self.row_sum[0] = sums[0][0] + sums[0][1]
+        else:
+            self.update_row_sum(p_quantized, row_scale, is_first)
+
+    @cute.jit
+    def update_row_sum_quantized_streaming(
+        self,
+        p_packed: cute.Tensor,
+        p_dtype: cutlass.Constexpr,
+        row_scale: Float32,
+        is_first: int = False,
+    ) -> None:
+        """update_row_sum_quantized for sm_100, after apply_exp2_convert reduced the FP32 P.
+
+        p_packed holds P in its 32-bit storage registers. Sums of E4M3 P (multiples of 2^-9 below
+        2^15) are exact in FP32 in any order; the previous row sum is added once at the end.
+        """
+        sums = [Float32(0.0)] * 4
+        for i in cutlass.range_constexpr(cute.size(p_packed)):
+            if cutlass.const_expr(p_dtype.width == 8):
+                sums = list(utils.add_packed_p_to_f32x4(p_packed[i], sums, p_dtype))
+            else:
+                k = 2 * (i % 2)
+                sums[k], sums[k + 1] = utils.add_packed_p_to_f32x4(
+                    p_packed[i], sums[k : k + 2], p_dtype
+                )
+        row_sum = (sums[0] + sums[1]) + (sums[2] + sums[3])
+        if cutlass.const_expr(not is_first):
+            row_sum = self.row_sum[0] * row_scale + row_sum
+        self.row_sum[0] = row_sum
+
+    @cute.jit
     def scale_subtract_rowmax(
         self,
         acc_S_row: cute.Tensor,
@@ -425,8 +494,15 @@ class SoftmaxSm100(Softmax):
         ex2_emu_freq: cutlass.Constexpr[int] = 0,
         ex2_emu_res: cutlass.Constexpr[int] = 4,
         ex2_emu_start_frg: cutlass.Constexpr[int] = 0,
+        unquantized_sum_init: Float32 | None = None,
     ):
+        """With unquantized_sum_init, accumulate row_sum_unquantized per fragment
+        during conversion, so FP32 P need not stay live until the row-sum update.
+        """
         assert cute.size(acc_S_row.shape) % 2 == 0, "acc_S_row must have an even number of elements"
+        track_sum = cutlass.const_expr(unquantized_sum_init is not None)
+        if cutlass.const_expr(track_sum):
+            sums = [(unquantized_sum_init, Float32(0.0))] + [(Float32(0.0), Float32(0.0))] * 3
         frg_tile = 32
         assert frg_tile % 2 == 0
         frg_cnt = cute.size(acc_S_row) // frg_tile
@@ -460,6 +536,17 @@ class SoftmaxSm100(Softmax):
             acc_S_row_converted_frg[None, j].store(
                 acc_S_row_frg[None, j].load().to(acc_S_row_converted.element_type)
             )
+            if cutlass.const_expr(track_sum):
+                for k in cutlass.range_constexpr(0, frg_tile, 8):
+                    for i in cutlass.range_constexpr(4):
+                        sums[i] = cute.arch.add_packed_f32x2(
+                            sums[i], (acc_S_row_frg[k + 2 * i, j], acc_S_row_frg[k + 2 * i + 1, j])
+                        )
+        if cutlass.const_expr(track_sum):
+            sums[0] = cute.arch.add_packed_f32x2(sums[0], sums[1])
+            sums[2] = cute.arch.add_packed_f32x2(sums[2], sums[3])
+            sums[0] = cute.arch.add_packed_f32x2(sums[0], sums[2])
+            self.row_sum_unquantized[0] = sums[0][0] + sums[0][1]
 
     @cute.jit
     def scale_apply_exp2_convert(
@@ -553,7 +640,7 @@ def apply_score_mod_inner(
         qk_acc_dtype: Data type for accumulator
         aux_tensors: Optional aux_tensors for FlexAttention
         aux_scalars: Optional runtime scalar captures for FlexAttention
-        fastdiv_mods: Tuple of (seqlen_q_divmod, seqlen_k_divmod) for wrapping
+        fastdiv_mods: Tuple of (seqlen_q_divmod, seqlen_k_divmod) bounding aux_tensors indices
         seqlen_info: Sequence length info
         constant_q_idx: If provided, use this constant for all q_idx values
                         If None, compute q_idx per-element
@@ -598,20 +685,18 @@ def apply_score_mod_inner(
                 head_offset = q_idx_packed - q_idx_logical * qhead_per_kvhead
                 head_idx_vec[j] = head_idx * qhead_per_kvhead + head_offset
 
-            # If we will do loads we mod, in order to not read OOB
+            # If we will do loads we clamp, in order to not read OOB
             if cutlass.const_expr(aux_data.tensors is not None and fastdiv_mods is not None):
                 if cutlass.const_expr(constant_q_idx is None):
                     seqlen_q_divmod, seqlen_k_divmod = fastdiv_mods
                     q_idx_floored = floor_if_packed(
                         index_tensor[i + j][q_idx_pos], qhead_per_kvhead
                     )
-                    _, q_idx_wrapped = divmod(q_idx_floored, seqlen_q_divmod)
-                    q_idx_vec[j] = q_idx_wrapped
+                    q_idx_vec[j] = utils.clamp_index(q_idx_floored, seqlen_q_divmod)
                 else:
                     _, seqlen_k_divmod = fastdiv_mods
 
-                _, kv_idx_wrapped = divmod(index_tensor[i + j][kv_idx_pos], seqlen_k_divmod)
-                kv_idx_vec[j] = kv_idx_wrapped
+                kv_idx_vec[j] = utils.clamp_index(index_tensor[i + j][kv_idx_pos], seqlen_k_divmod)
             else:
                 # No bounds checking - direct indexing
                 if constant_q_idx is None:
@@ -683,7 +768,7 @@ def apply_score_mod_bwd_inner(
         qk_acc_dtype: Data type for accumulator
         aux_tensors: Optional aux_tensors for FlexAttention
         aux_scalars: Optional runtime scalar captures for FlexAttention
-        fastdiv_mods: Tuple of (seqlen_q_divmod, seqlen_k_divmod) for wrapping
+        fastdiv_mods: Tuple of (seqlen_q_divmod, seqlen_k_divmod) bounding aux_tensors indices
         seqlen_info: Sequence length info
         constant_q_idx: If provided, use this constant for all q_idx values
         qhead_per_kvhead: Pack-GQA replication factor
@@ -727,13 +812,11 @@ def apply_score_mod_bwd_inner(
                     q_idx_floored = floor_if_packed(
                         index_tensor[i + j][q_idx_pos], qhead_per_kvhead
                     )
-                    _, q_idx_wrapped = divmod(q_idx_floored, seqlen_q_divmod)
-                    q_idx_vec[j] = q_idx_wrapped
+                    q_idx_vec[j] = utils.clamp_index(q_idx_floored, seqlen_q_divmod)
                 else:
                     _, seqlen_k_divmod = fastdiv_mods
 
-                _, kv_idx_wrapped = divmod(index_tensor[i + j][kv_idx_pos], seqlen_k_divmod)
-                kv_idx_vec[j] = kv_idx_wrapped
+                kv_idx_vec[j] = utils.clamp_index(index_tensor[i + j][kv_idx_pos], seqlen_k_divmod)
             else:
                 # No bounds checking - direct indexing
                 if constant_q_idx is None:
