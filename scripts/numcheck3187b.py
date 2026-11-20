@@ -4,7 +4,7 @@ from flash_attn.cute.interface import flash_attn_func
 out = {}
 for (bs, sq, sk, h, hk, hd, causal) in [(2, 8192, 8192, 16, 4, 128, True), (2, 4096, 4096, 16, 4, 128, False), (2, 3000, 4096, 16, 4, 128, True),
                                         (2, 4096, 3000, 16, 2, 128, True), (2, 2000, 2000, 8, 1, 128, True), (2, 4096, 4096, 16, 8, 64, True),
-                                        (2, 4096, 4096, 16, 4, 96, True), (1, 4096, 4096, 8, 2, 256, True)]:
+                                        (2, 4096, 4096, 16, 4, 96, True)] + ([] if __import__("os").environ.get("FA_DISABLE_2CTA") else [(1, 4096, 4096, 8, 2, 256, True)]):
     torch.manual_seed(0)
     q = torch.randn(bs, sq, h, hd, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     k = torch.randn(bs, sk, hk, hd, device="cuda", dtype=torch.bfloat16, requires_grad=True)
