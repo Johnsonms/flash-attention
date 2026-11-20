@@ -1,0 +1,5 @@
+# reps=10 sleep=1.0 loops=1 fwd=False presleep=0
+loop seqlen causal batch             t0             t1        ms TFLOPS
+   0   2048   True    16 1795212074.675 1795212074.689     0.854    805
+   0   8192   True     4 1795212075.698 1795212075.727     2.360   1165
+   0  32768   True     1 1795212076.740 1795212076.846     8.833   1245
